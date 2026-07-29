@@ -7,8 +7,9 @@ realtime_detector.py — 实时碎片识别（深色底板 + 白色碎片，V通
   3. ROI亮度 → Gamma安全区 (80-160不触发)
   4. CLAHE V通道增强
   5. OTSU自动阈值 → V通道Mask
-  6. Canny边缘融合
-  7. Close→Open→Dilate + convexHull + minAreaRect
+  6. V自适应局部阈值(51×51) + S低饱和辅助
+  7. Canny边缘融合
+  8. 双级联Close + 重叠合并 + 面积过滤 + top-4
 
 用法：
   python realtime_detector.py                        # HTTP 流
@@ -252,40 +253,38 @@ def _merge_overlapping(contours, overlap_thresh=0.5):
 
 def detect_fused(frame_bgr):
     """
-    S+V 双通道融合检测。
+    V 自适应局部阈值（主力） + S 通道辅助。
 
-    S 通道（饱和度）——阴影不变量：
-      白色碎片 S≈0，无论明暗。有色底板 S>0。
-      用 OTSU 反转取低饱和度区域，阴影下也稳定。
+    V 自适应：每个 51×51 窗口独立判断亮度分界。
+      碎片一半在光里一半在阴影 → 两个窗口各自算出自己的阈值
+      → 碎片在两个窗口内都被正确切出。
+      深底板 V 低 → 即使自适应也不会被误检。
 
-    V 通道（亮度）——排除暗区：
-      深色底板和黑分界线 V 低。用 V > 阈值排除这些暗区。
-
-    融合：S_low AND V_not_dark → 白色碎片候选。
+    S 通道辅助：白色碎片 S≈0，不随光照变化。
+      排除有色噪点（桌面纹理、手等）。
     """
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     h, s, v = cv2.split(hsv)
 
-    # ---- S 通道：CLAHE → OTSU 反转（低饱和度=碎片） ----
-    s_eq = CLAHE.apply(s)
-    s_thresh, _ = cv2.threshold(s_eq, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    s_thresh = max(s_thresh, 30)  # 最低保护，防止全图当碎片
-    _, mask_s = cv2.threshold(s_eq, s_thresh, 255, cv2.THRESH_BINARY_INV)
-
-    # ---- V 通道：CLAHE → OTSU（排除暗区：底板、分界线、深阴影） ----
+    # ---- V 通道：CLAHE → 自适应局部阈值（主力） ----
     v_eq = CLAHE.apply(v)
-    v_thresh, _ = cv2.threshold(v_eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    v_thresh = v_thresh * 0.8  # 略低于最优，宁可多保留
-    _, mask_v = cv2.threshold(v_eq, v_thresh, 255, cv2.THRESH_BINARY)
+    # Gaussian 局部阈值：每个 51×51 窗口独立算
+    mask_v = cv2.adaptiveThreshold(v_eq, 255,
+                                   cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY, 51, 10)
 
-    # ---- 融合：低饱和度 AND 足够亮 ----
-    mask = cv2.bitwise_and(mask_s, mask_v)
+    # ---- S 通道：低饱和度 Mask（辅助排除有色噪点） ----
+    s_eq = CLAHE.apply(s)
+    _, mask_s = cv2.threshold(s_eq, 50, 255, cv2.THRESH_BINARY_INV)
+
+    # ---- 融合：V 自适应 AND S 低饱和 ----
+    mask = cv2.bitwise_and(mask_v, mask_s)
 
     # 排除分界线
     mid_y = mask.shape[0] // 2
     mask[mid_y - 8 : mid_y + 8, :] = 0
 
-    # Canny 边缘补强（扑克牌图案场景）
+    # Canny 边缘补强
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blur, 30, 100)
@@ -295,7 +294,7 @@ def detect_fused(frame_bgr):
     edges_closed = cv2.morphologyEx(edges_filtered, cv2.MORPH_CLOSE, k7, iterations=2)
     mask = cv2.bitwise_or(mask, edges_closed)
 
-    return _polys_from_mask(mask), s_thresh
+    return _polys_from_mask(mask), 0
 
 def detect_robust(frame_bgr):
     warped, roi, has_warp = find_a4_roi(frame_bgr)
