@@ -48,43 +48,100 @@ def camera_auto_setup(device="/dev/video0"):
 
 
 # =========================================================================
-# A4 纸定位（深色纸+白色角标） + 透视矫正
+# A4 纸定位（深色纸+白色角标） + 帧间平滑 + 质量门
 # =========================================================================
 
-def find_a4_roi(frame_bgr):
-    """
-    深色 A4 纸：四个角贴白色标记点。
-    Canny 梯度 + V 通道亮斑双条件检测。
-    找不到则退回原图。
-    """
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+# 角标坐标 EMA 平滑状态
+_smoothed_corners = None  # None = 未初始化，首次检测到后初始化
+EMA_ALPHA = 0.4           # 平滑系数: 0=完全不动 1=不用平滑
 
-    # 方法1：Canny 边缘 → 最大四边形
-    edges = cv2.Canny(blur, 30, 100)
+
+def _extract_corners(frame_bgr):
+    """
+    多方法提取 A4 纸四角（候选点，未排序未验证）。
+    返回: (4×2) np.float32 数组 或 None
+    """
+    # CLAHE 增强上半区对比度（角标在深色纸上的白色标记）
+    h, w = frame_bgr.shape[:2]
+    upper = frame_bgr[:h // 2, :, :]
+    gray_upper = cv2.cvtColor(upper, cv2.COLOR_BGR2GRAY)
+    gray_upper = CLAHE.apply(gray_upper)
+
+    # 方法1：CLAHE + Canny → 最大四边形
+    edges = cv2.Canny(gray_upper, 30, 100)
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
     if contours:
         best = max(contours, key=cv2.contourArea)
         peri = cv2.arcLength(best, True)
         approx = cv2.approxPolyDP(best, 0.02 * peri, True)
-        if len(approx) == 4 and cv2.contourArea(approx) > frame_bgr.shape[0] * frame_bgr.shape[1] * 0.1:
-            return _do_warp(frame_bgr, approx.reshape(4, 2).astype(np.float32))
+        if len(approx) == 4:
+            return approx.reshape(4, 2).astype(np.float32)
 
-    # 方法2：V通道亮斑 → 白色角标 → 取四角的外接四边形
-    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-    v = hsv[:, :, 2]
+    # 方法2：V通道亮斑 → minAreaRect 外接四边形
+    hsv = cv2.cvtColor(upper, cv2.COLOR_BGR2HSV)
+    v = CLAHE.apply(hsv[:, :, 2])
     _, bright = cv2.threshold(v, 180, 255, cv2.THRESH_BINARY)
     contours_b, _ = cv2.findContours(bright, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if contours_b:
         all_pts = np.vstack([c.reshape(-1, 2) for c in contours_b])
         if len(all_pts) >= 4:
             rect = cv2.minAreaRect(all_pts.astype(np.float32))
-            box = cv2.boxPoints(rect).astype(np.float32)
-            if cv2.contourArea(box.astype(np.int32)) > frame_bgr.shape[0] * frame_bgr.shape[1] * 0.1:
-                return _do_warp(frame_bgr, box)
+            return cv2.boxPoints(rect).astype(np.float32)
 
-    return frame_bgr, None, False
+    return None
+
+
+def _quality_check(pts, frame_shape):
+    """验证四点是否构成合理的 A4 纸四边形。"""
+    if pts is None or len(pts) != 4:
+        return False
+    # 排序后测量边长
+    s = pts.sum(axis=1); diff = np.diff(pts, axis=1)
+    ordered = np.array([pts[np.argmin(s)], pts[np.argmin(diff)],
+                        pts[np.argmax(s)], pts[np.argmax(diff)]], dtype=np.float32)
+    w_top = np.linalg.norm(ordered[1] - ordered[0])
+    w_bot = np.linalg.norm(ordered[2] - ordered[3])
+    h_left = np.linalg.norm(ordered[3] - ordered[0])
+    h_right = np.linalg.norm(ordered[2] - ordered[1])
+    # A4 比例 ~0.707 (210/297)
+    ratio = ((w_top + w_bot) / 2) / ((h_left + h_right) / 2) if (h_left + h_right) > 0 else 0
+    if ratio < 0.5 or ratio > 0.9:  # 极宽或极窄 → 不合格
+        return False
+    # 面积 > 画面 15%
+    area = cv2.contourArea(ordered.astype(np.int32).reshape(-1, 1, 2))
+    if area < frame_shape[0] * frame_shape[1] * 0.1:
+        return False
+    return True
+
+
+def find_a4_roi(frame_bgr):
+    """
+    帧间平滑 + 质量门 + 透视矫正。
+    角标坐标经 EMA 平滑后再用于变换，消除画面抖动。
+    质量不合格 → 退回 Raw。
+    """
+    global _smoothed_corners
+
+    raw_pts = _extract_corners(frame_bgr)
+
+    if raw_pts is None:
+        # 本帧提取失败，继续用上一次的平滑坐标（如果有）
+        if _smoothed_corners is None:
+            return frame_bgr, None, False
+        raw_pts = _smoothed_corners  # 沿用上一帧
+
+    # EMA 平滑
+    if _smoothed_corners is None:
+        _smoothed_corners = raw_pts.astype(np.float32)
+    else:
+        _smoothed_corners = (EMA_ALPHA * raw_pts +
+                             (1 - EMA_ALPHA) * _smoothed_corners).astype(np.float32)
+
+    # 质量门
+    if not _quality_check(_smoothed_corners, frame_bgr.shape):
+        return frame_bgr, None, False
+
+    return _do_warp(frame_bgr, _smoothed_corners)
 
 
 def _do_warp(frame_bgr, pts):
