@@ -57,18 +57,18 @@ def find_a4_roi(frame_bgr):
     edges = cv2.Canny(blur, 30, 100)
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
-        return frame_bgr, None
+        return frame_bgr, None, False
 
     # 找最大四边形
     best = max(contours, key=cv2.contourArea)
     peri = cv2.arcLength(best, True)
     approx = cv2.approxPolyDP(best, 0.02 * peri, True)
     if len(approx) != 4:
-        return frame_bgr, None
+        return frame_bgr, None, False
 
     # 面积太小 → 不是纸
     if cv2.contourArea(approx) < frame_bgr.shape[0] * frame_bgr.shape[1] * 0.15:
-        return frame_bgr, None
+        return frame_bgr, None, False
 
     # 排序：左上 右上 右下 左下
     pts = approx.reshape(4, 2).astype(np.float32)
