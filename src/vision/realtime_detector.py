@@ -25,8 +25,8 @@ import threading
 # HSV 碎片检测（与 fragment_detector.py 相同逻辑）
 # =========================================================================
 
-YELLOW_LOW = np.array([20, 60, 80], dtype=np.uint8)
-YELLOW_HIGH = np.array([40, 255, 255], dtype=np.uint8)
+YELLOW_LOW = np.array([18, 50, 70], dtype=np.uint8)
+YELLOW_HIGH = np.array([43, 255, 255], dtype=np.uint8)
 MIN_AREA = 500
 EPSILON_RATIO = 0.008
 
