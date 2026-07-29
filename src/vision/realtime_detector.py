@@ -1,41 +1,114 @@
 """
-realtime_detector.py — 摄像头实时碎片识别
+realtime_detector.py — 摄像头实时碎片识别（鲁棒增强版）
 
-两种显示模式：
-  1. HTTP 流（默认）→ 浏览器打开 http://<树莓派IP>:8080 看实时画面
-  2. 本地窗口 → --display 参数（需要连接显示器）
+多层检测策略（光照变化自适应）：
+  第 1 层：HSV 颜色检测（光照正常时，~15ms）
+  第 2 层：Canny 边缘兜底（光照差时，~30ms）
+  第 3 层：CLAHE 增强 + HSV + 边缘融合（极端光照）
 
 用法：
   python realtime_detector.py                        # HTTP 流模式
   python realtime_detector.py --display               # 本地窗口模式
-  python realtime_detector.py --width 1280 --height 720  # 低分辨率
+  python realtime_detector.py --width 1280 --height 720
 
-依赖（树莓派）：
-  pip install opencv-python flask
+依赖：
+  pip install opencv-python flask numpy
 """
 
-import cv2
-import numpy as np
-import argparse
-import time
-import threading
+import cv2, numpy as np, argparse, time, subprocess, os
 
 
 # =========================================================================
-# HSV 碎片检测（与 fragment_detector.py 相同逻辑）
+# HSV 阈值（保持严格，用多层兜底代替盲目放宽）
 # =========================================================================
-
-YELLOW_LOW = np.array([18, 50, 70], dtype=np.uint8)
+YELLOW_LOW  = np.array([18, 50, 70], dtype=np.uint8)
 YELLOW_HIGH = np.array([43, 255, 255], dtype=np.uint8)
 MIN_AREA = 500
 EPSILON_RATIO = 0.008
 
+# CLAHE 增强器（全局单例）
+CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
-def detect_fragments(frame_bgr):
-    """检测黄色碎片，返回多边形列表 (N,2) 像素坐标。"""
+
+# =========================================================================
+# 摄像头自动控制
+# =========================================================================
+
+def camera_auto_setup(device="/dev/video0"):
+    """设置摄像头为自动曝光 + 自动白平衡（光照变化自适应）。"""
+    try:
+        subprocess.run(["v4l2-ctl", "-d", device,
+                        "--set-ctrl=auto_exposure=3"],        # Aperture Priority
+                       capture_output=True, timeout=3)
+        subprocess.run(["v4l2-ctl", "-d", device,
+                        "--set-ctrl=white_balance_automatic=1"],
+                       capture_output=True, timeout=3)
+        print("[Camera] AE=AperturePriority  AWB=ON")
+        return True
+    except Exception as e:
+        print(f"[Camera] v4l2-ctl failed: {e}  (ignored, continuing)")
+        return False
+
+
+# =========================================================================
+# 第 1 层：HSV 颜色检测
+# =========================================================================
+
+def detect_hsv(frame_bgr):
+    """HSV 黄色碎片检测。"""
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, YELLOW_LOW, YELLOW_HIGH)
+    return _mask_to_polygons(mask)
 
+
+# =========================================================================
+# 第 2 层：Canny 边缘兜底
+# =========================================================================
+
+def detect_edges(frame_bgr):
+    """Canny 边缘检测 → 形态学闭合 → 提取多边形。"""
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 30, 100)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=3)
+    return _mask_to_polygons(closed, min_area=800)
+
+
+# =========================================================================
+# 第 3 层：CLAHE 增强 + HSV + 边缘融合
+# =========================================================================
+
+def detect_enhanced(frame_bgr):
+    """CLAHE 局部增强 → HSV + 边缘融合。"""
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+
+    # CLAHE 增强 V 通道（暗处提亮、亮处压暗）
+    v_eq = CLAHE.apply(v)
+    hsv_eq = cv2.merge([h, s, v_eq])
+
+    # HSV 检测
+    mask_hsv = cv2.inRange(hsv_eq, YELLOW_LOW, YELLOW_HIGH)
+
+    # 边缘检测
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 30, 100)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask_edge = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    # 融合：HSV 或 边缘命中即算
+    mask = cv2.bitwise_or(mask_hsv, mask_edge)
+    return _mask_to_polygons(mask, min_area=600)
+
+
+# =========================================================================
+# 多边形提取（共用）
+# =========================================================================
+
+def _mask_to_polygons(mask, min_area=MIN_AREA):
+    """二值掩码 → findContours → approxPolyDP → 多边形列表。"""
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
@@ -43,7 +116,7 @@ def detect_fragments(frame_bgr):
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     polygons = []
     for cnt in contours:
-        if cv2.contourArea(cnt) < MIN_AREA:
+        if cv2.contourArea(cnt) < min_area:
             continue
         peri = cv2.arcLength(cnt, True)
         approx = cv2.approxPolyDP(cnt, EPSILON_RATIO * peri, True)
@@ -51,158 +124,134 @@ def detect_fragments(frame_bgr):
             polygons.append(approx.reshape(-1, 2).astype(np.int32))
 
     polygons.sort(key=lambda p: cv2.contourArea(p.reshape(-1, 1, 2)), reverse=True)
-    return polygons, mask
+    return polygons
 
 
 # =========================================================================
-# 绘制检测框
+# 多层融合主入口
+# =========================================================================
+
+def detect_robust(frame_bgr):
+    """
+    多层鲁棒检测：
+      第 1 层 HSV → 第 2 层边缘兜底 → 第 3 层 CLAHE 融合
+    返回 (polygons, method_name)
+    """
+    # 第 1 层：HSV
+    polygons = detect_hsv(frame_bgr)
+    if len(polygons) >= 4:
+        return polygons, "HSV"
+
+    # 第 2 层：边缘兜底
+    edge_polys = detect_edges(frame_bgr)
+    if len(edge_polys) > len(polygons):
+        polygons = edge_polys
+    if len(polygons) >= 4:
+        return polygons, "Canny"
+
+    # 第 3 层：CLAHE 融合
+    enhanced = detect_enhanced(frame_bgr)
+    if len(enhanced) >= len(polygons):
+        polygons = enhanced
+    return polygons, "CLAHE" if len(polygons) >= 4 else "Multi"
+
+
+# =========================================================================
+# 绘制
 # =========================================================================
 
 COLORS = [(0, 255, 0), (0, 255, 255), (255, 0, 255), (255, 255, 0)]
 
 
-def draw_overlay(frame, polygons, fps):
-    """在帧上绘制碎片多边形和信息。"""
+def draw_overlay(frame, polygons, fps, method):
     vis = frame.copy()
-
-    # 半透明覆盖
     overlay = frame.copy()
     for i, poly in enumerate(polygons):
-        color = COLORS[i % 4]
-        cv2.fillPoly(overlay, [poly.reshape((-1, 1, 2))], color)
+        cv2.fillPoly(overlay, [poly.reshape((-1, 1, 2))], COLORS[i % 4])
     cv2.addWeighted(overlay, 0.25, vis, 0.75, 0, vis)
-
-    # 多边形边框
     for i, poly in enumerate(polygons):
-        color = COLORS[i % 4]
-        cv2.polylines(vis, [poly.reshape((-1, 1, 2))], True, color, 2)
-
-        # 重心 + 标签
+        c = COLORS[i % 4]
+        cv2.polylines(vis, [poly.reshape((-1, 1, 2))], True, c, 2)
         M = cv2.moments(poly)
         if M["m00"] > 0:
-            cx = int(M["m10"] / M["m00"])
-            cy = int(M["m01"] / M["m00"])
-            cv2.circle(vis, (cx, cy), 4, color, -1)
-            cv2.putText(vis, f"F{i}", (cx + 8, cy),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            cx, cy = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
+            cv2.circle(vis, (cx, cy), 4, c, -1)
+            cv2.putText(vis, f"F{i} {len(poly)}e", (cx + 8, cy),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, c, 2)
 
-            # 顶点数
-            cv2.putText(vis, f"{len(poly)}edges", (cx + 8, cy + 15),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
-
-    # 顶部状态栏
     h, w = vis.shape[:2]
-    bar = np.zeros((40, w, 3), dtype=np.uint8)
-    bar[:] = (40, 40, 40)
-    cv2.putText(bar, f"Fragments: {len(polygons)}  |  FPS: {fps:.1f}",
+    bar = np.zeros((40, w, 3), dtype=np.uint8) + 40
+    cv2.putText(bar, f"Frags: {len(polygons)} | {method} | {fps:.1f} fps",
                 (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-    cv2.putText(bar, "Press Q to quit",
-                (w - 200, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
-
     return np.vstack([bar, vis])
 
 
 # =========================================================================
-# 本地窗口模式
+# 本地窗口
 # =========================================================================
 
 def run_display(cap, width, height):
-    """本地 OpenCV 窗口显示。"""
     cv2.namedWindow("Fragment Detector", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("Fragment Detector", width, height + 40)
-
-    print(f"[Display] 分辨率 {width}x{height}  按 Q 退出")
-
-    fps_t0 = time.time()
-    fps_count = 0
-    fps_val = 0.0
-
+    print(f"[Display] {width}x{height}  按 Q 退出")
+    fps_t0, fps_count, fps_val = time.time(), 0, 0.0
     while True:
         ret, frame = cap.read()
-        if not ret:
-            break
-
-        # 可选：缩放到处理分辨率
+        if not ret: break
         if frame.shape[1] != width:
             frame = cv2.resize(frame, (width, height))
-
-        polygons, mask = detect_fragments(frame)
-        vis = draw_overlay(frame, polygons, fps_val)
-
+        polys, method = detect_robust(frame)
+        vis = draw_overlay(frame, polys, fps_val, method)
         cv2.imshow("Fragment Detector", vis)
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            break
-
+        if cv2.waitKey(1) & 0xFF == ord('q'): break
         fps_count += 1
         if fps_count % 30 == 0:
-            elapsed = time.time() - fps_t0
-            fps_val = 30 / elapsed
+            fps_val = 30 / (time.time() - fps_t0)
             fps_t0 = time.time()
-
     cv2.destroyAllWindows()
 
 
 # =========================================================================
-# HTTP MJPEG 流模式（浏览器查看）
+# HTTP 流
 # =========================================================================
 
 def run_http_stream(cap, width, height, port=8080):
-    """HTTP MJPEG 流，浏览器打开 http://<IP>:<port> 查看。"""
-    try:
-        from flask import Flask, Response
-    except ImportError:
-        print("[ERROR] 需要 flask: pip install flask")
-        return
-
+    from flask import Flask, Response
     app = Flask(__name__)
-    fps_val = [0.0]  # mutable reference
-    fps_t0 = [time.time()]
-    fps_count = [0]
+    fps_val, fps_t0, fps_count = [0.0], [time.time()], [0]
 
-    def generate_frames():
+    def generate():
         while True:
             ret, frame = cap.read()
-            if not ret:
-                break
+            if not ret: break
             if frame.shape[1] != width:
                 frame = cv2.resize(frame, (width, height))
-
-            polygons, _ = detect_fragments(frame)
-            vis = draw_overlay(frame, polygons, fps_val[0])
-
-            _, jpeg = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' +
-                   jpeg.tobytes() + b'\r\n')
-
+            polys, method = detect_robust(frame)
+            vis = draw_overlay(frame, polys, fps_val[0], method)
+            _, jpg = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' +
+                   jpg.tobytes() + b'\r\n')
             fps_count[0] += 1
             if fps_count[0] % 30 == 0:
-                elapsed = time.time() - fps_t0[0]
-                fps_val[0] = 30 / elapsed
+                fps_val[0] = 30 / (time.time() - fps_t0[0])
                 fps_t0[0] = time.time()
 
     @app.route('/')
     def index():
-        return f"""<html><head><title>Fragment Detector</title></head>
+        return f"""<html><head><title>Puzzle Detector</title></head>
         <body style="background:#111;text-align:center;font-family:Arial">
-        <h2 style="color:#fff">Real-time Fragment Detection</h2>
+        <h2 style="color:#fff">Fragment Detector</h2>
         <img src="/stream" style="max-width:100%">
-        <p style="color:#666">Resolution: {width}x{height} | Port: {port}</p>
-        </body></html>"""
+        <p style="color:#666">{width}x{height} | :{port}</p></body></html>"""
 
     @app.route('/stream')
     def stream():
-        return Response(generate_frames(),
-                        mimetype='multipart/x-mixed-replace; boundary=frame')
+        return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
     print(f"\n{'='*50}")
-    print(f"  HTTP 流已启动")
-    print(f"  浏览器打开: http://<树莓派IP>:{port}")
-    print(f"  分辨率: {width}x{height}")
-    print(f"  按 Ctrl+C 停止")
+    print(f"  HTTP: http://<IP>:{port}")
+    print(f"  {width}x{height}  |  多层检测: HSV → Canny → CLAHE")
     print(f"{'='*50}\n")
-
     app.run(host='0.0.0.0', port=port, threaded=True)
 
 
@@ -211,43 +260,38 @@ def run_http_stream(cap, width, height, port=8080):
 # =========================================================================
 
 def main():
-    p = argparse.ArgumentParser(description="摄像头实时碎片识别")
-    p.add_argument("--display", action="store_true", help="本地窗口模式（需显示器）")
-    p.add_argument("--port", type=int, default=8080, help="HTTP 流端口（默认 8080）")
-    p.add_argument("--width", type=int, default=1280, help="处理宽度")
-    p.add_argument("--height", type=int, default=720, help="处理高度")
-    p.add_argument("--device", type=int, default=0, help="摄像头设备号（默认 0）")
+    p = argparse.ArgumentParser(description="碎片实时识别（鲁棒版）")
+    p.add_argument("--display", action="store_true")
+    p.add_argument("--port", type=int, default=8080)
+    p.add_argument("--width", type=int, default=1280)
+    p.add_argument("--height", type=int, default=720)
+    p.add_argument("--device", type=int, default=0)
     args = p.parse_args()
 
-    # 打开摄像头（V4L2 后端，避免 GStreamer 兼容问题）
+    # 摄像头自动控制
+    camera_auto_setup(f"/dev/video{args.device}")
+
     cap = cv2.VideoCapture(args.device, cv2.CAP_V4L2)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
     cap.set(cv2.CAP_PROP_FPS, 30)
 
-    # 如果 V4L2 + MJPG 失败，尝试默认后端
     if not cap.isOpened():
         cap = cv2.VideoCapture(args.device)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
 
     if not cap.isOpened():
-        print(f"[ERROR] 无法打开摄像头 /dev/video{args.device}")
-        print("  检查: ls -l /dev/video*")
-        print("  尝试: python realtime_detector.py --device 1")
+        print(f"[ERROR] 摄像头 /dev/video{args.device} 无法打开")
         return
 
-    actual_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-    actual_h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    print(f"摄像头已打开: {actual_w:.0f}x{actual_h:.0f} @ {fps:.0f}fps")
+    print(f"摄像头: {cap.get(cv2.CAP_PROP_FRAME_WIDTH):.0f}x{cap.get(cv2.CAP_PROP_FRAME_HEIGHT):.0f}")
 
     if args.display:
         run_display(cap, args.width, args.height)
     else:
         run_http_stream(cap, args.width, args.height, args.port)
-
     cap.release()
 
 
