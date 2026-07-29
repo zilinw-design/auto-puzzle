@@ -206,7 +206,9 @@ def _polys_from_mask(mask, min_area=MIN_AREA, max_area=MAX_AREA):
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     filtered = [c for c in contours if min_area < cv2.contourArea(c) < max_area]
+    # 先合并重叠的（阴影断裂），再合并距离<6px的（碎片间不碰）
     merged = _merge_overlapping(filtered, overlap_thresh=0.7)
+    merged = _merge_close_neighbors(merged, max_gap_px=6)
     merged.sort(key=cv2.contourArea, reverse=True)
     merged = merged[:4]
 
@@ -249,6 +251,61 @@ def _merge_overlapping(contours, overlap_thresh=0.5):
     for g in groups.values():
         result.append(g[0] if len(g) == 1 else cv2.convexHull(np.vstack(g)))
     return result
+
+
+def _merge_close_neighbors(contours, max_gap_px=6):
+    """
+    合并距离很近的轮廓（修复碎片内部阴影裂缝）。
+    碎片间间距≥3mm(9px)，裂缝<2px，用 max_gap_px=6 安全分隔两者。
+    """
+    if len(contours) <= 1:
+        return contours
+    n = len(contours)
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]; x = parent[x]
+        return x
+
+    def union(a, b):
+        parent[find(a)] = find(b)
+
+    # 计算每个轮廓的最小间距
+    for i in range(n):
+        for j in range(i + 1, n):
+            # 两个轮廓之间的最小距离
+            min_d = cv2.pointPolygonTest(contours[i],
+                    (float(cv2.boundingRect(contours[j])[0] + cv2.boundingRect(contours[j])[2] / 2),
+                     float(cv2.boundingRect(contours[j])[1] + cv2.boundingRect(contours[j])[3] / 2)),
+                    True)
+            min_d = min(abs(min_d), _contour_distance(contours[i], contours[j], max_gap_px))
+            if min_d < max_gap_px:
+                union(i, j)
+
+    groups = {}
+    for i in range(n):
+        root = find(i)
+        groups.setdefault(root, []).append(contours[i])
+    result = []
+    for g in groups.values():
+        result.append(g[0] if len(g) == 1 else cv2.convexHull(np.vstack(g)))
+    return result
+
+
+def _contour_distance(c1, c2, max_gap=6):
+    """两个轮廓之间的最小距离。"""
+    r1 = cv2.boundingRect(c1)
+    r2 = cv2.boundingRect(c2)
+    # 快速 AABB 距离过滤
+    dx = max(0, max(r1[0], r2[0]) - min(r1[0] + r1[2], r2[0] + r2[2]))
+    dy = max(0, max(r1[1], r2[1]) - min(r1[1] + r1[3], r2[1] + r2[3]))
+    if dx > max_gap or dy > max_gap:
+        return float('inf')
+    min_d = float('inf')
+    for p1 in c1.reshape(-1, 2).astype(np.float32):
+        min_d = min(min_d, abs(cv2.pointPolygonTest(c2, tuple(p1), True)))
+    return min_d
 
 
 def detect_fused(frame_bgr):
