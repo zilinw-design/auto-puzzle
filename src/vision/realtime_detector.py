@@ -171,7 +171,7 @@ def run_http_stream(cap, width, height, port=8080):
             polygons, _ = detect_fragments(frame)
             vis = draw_overlay(frame, polygons, fps_val[0])
 
-            _, jpeg = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 75])
+            _, jpeg = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' +
                    jpeg.tobytes() + b'\r\n')
