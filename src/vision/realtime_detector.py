@@ -86,7 +86,7 @@ def find_a4_roi(frame_bgr):
     # ROI：纸面上半部分（碎片区域）
     h_warped = warped.shape[0]
     roi = warped[:h_warped // 2, :, :]
-    return warped, roi
+    return warped, roi, True
 
 
 # =========================================================================
@@ -168,8 +168,7 @@ def detect_robust(frame_bgr):
     2. Gamma 亮度自适应
     3. 双模式：正常→HSV，偏暗→边缘融合
     """
-    # 透视矫正
-    warped, roi = find_a4_roi(frame_bgr)
+    warped, roi, has_warp = find_a4_roi(frame_bgr)
 
     # Gamma 校正
     corrected, brightness, gamma = gamma_correct(warped, roi)
@@ -190,7 +189,7 @@ def detect_robust(frame_bgr):
         polys = edge_polys if len(edge_polys) > len(polys) else polys
         mode = "HSV→Edge"
 
-    return polys, mode, brightness, gamma, warped
+    return polys, mode, brightness, gamma, warped, has_warp
 
 
 # =========================================================================
@@ -199,7 +198,7 @@ def detect_robust(frame_bgr):
 
 COLORS = [(0, 255, 0), (0, 255, 255), (255, 0, 255), (255, 255, 0)]
 
-def draw_overlay(warped, polygons, fps, mode, brightness, gamma):
+def draw_overlay(warped, polygons, fps, mode, brightness, gamma, has_warp):
     vis = warped.copy()
     overlay = warped.copy()
     for i, poly in enumerate(polygons):
@@ -217,8 +216,9 @@ def draw_overlay(warped, polygons, fps, mode, brightness, gamma):
 
     h, w = vis.shape[:2]
     bar = np.zeros((40, w, 3), dtype=np.uint8) + 40
+    warp_str = 'Warp' if has_warp else 'Raw'
     bri_str = f"Bri:{brightness:.0f}" + (f" G:{gamma:.2f}" if abs(gamma - 1) > 0.01 else "")
-    cv2.putText(bar, f"Frags:{len(polygons)} | {mode} | {bri_str} | {fps:.1f}fps",
+    cv2.putText(bar, f"Frags:{len(polygons)} | {warp_str} | {mode} | {bri_str} | {fps:.1f}fps",
                 (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     return np.vstack([bar, vis])
 
@@ -237,8 +237,8 @@ def run_display(cap, width, height):
         if not ret: break
         if frame.shape[1] != width:
             frame = cv2.resize(frame, (width, height))
-        polys, mode, bri, gam, warped = detect_robust(frame)
-        vis = draw_overlay(warped, polys, fps_val, mode, bri, gam)
+        polys, mode, bri, gam, warped, has_warp = detect_robust(frame)
+        vis = draw_overlay(warped, polys, fps_val, mode, bri, gam, has_warp)
         cv2.imshow("Detector", vis)
         if cv2.waitKey(1) & 0xFF == ord('q'): break
         fps_cnt += 1
@@ -262,8 +262,8 @@ def run_http_stream(cap, width, height, port=8080):
             if not ret: break
             if frame.shape[1] != width:
                 frame = cv2.resize(frame, (width, height))
-            polys, mode, bri, gam, warped = detect_robust(frame)
-            vis = draw_overlay(warped, polys, fps_val[0], mode, bri, gam)
+            polys, mode, bri, gam, warped, has_warp = detect_robust(frame)
+            vis = draw_overlay(warped, polys, fps_val[0], mode, bri, gam, has_warp)
             _, jpg = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
             yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' +
                    jpg.tobytes() + b'\r\n')
