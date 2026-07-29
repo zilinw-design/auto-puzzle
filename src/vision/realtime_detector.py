@@ -110,7 +110,7 @@ def _quality_check(pts, frame_shape):
         return False
     # 面积 > 画面 15%
     area = cv2.contourArea(ordered.astype(np.int32).reshape(-1, 1, 2))
-    if area < frame_shape[0] * frame_shape[1] * 0.1:
+    if area < frame_shape[0] * frame_shape[1] * 0.05:
         return False
     return True
 
@@ -189,12 +189,12 @@ def gamma_correct(img_bgr, roi=None):
 
 def _polys_from_mask(mask, min_area=MIN_AREA, max_area=MAX_AREA):
     k7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    k15 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    k9 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
-    # 1. Close(7x7,3) + Close(15x15,1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k7, iterations=3)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k15, iterations=1)
+    # 1. Close(7x7,2) + Close(9x9,1) — 修复阴影但不粘连相邻碎片
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k7, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k9, iterations=1)
     # 2. Open(5x5,1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k5, iterations=1)
 
@@ -206,7 +206,7 @@ def _polys_from_mask(mask, min_area=MIN_AREA, max_area=MAX_AREA):
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     filtered = [c for c in contours if min_area < cv2.contourArea(c) < max_area]
-    merged = _merge_overlapping(filtered)
+    merged = _merge_overlapping(filtered, overlap_thresh=0.7)
     merged.sort(key=cv2.contourArea, reverse=True)
     merged = merged[:4]
 
