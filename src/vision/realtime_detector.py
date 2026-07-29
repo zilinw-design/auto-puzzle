@@ -21,12 +21,14 @@ import cv2, numpy as np, argparse, time, subprocess, os
 # =========================================================================
 # 参数
 # =========================================================================
-MIN_AREA = 500
+MIN_AREA = 800     # 物理面积下限 (~2cm²碎片 @3px/mm)
+MAX_AREA = 5000    # 物理面积上限 (~14cm²碎片)，排除整张纸误检
+BORDER_CROP = 10   # 透视矫正后向内裁剪 px，消除边界泄露
 EPSILON = 0.008
-TARGET_BRIGHTNESS = 120    # 目标亮度
-BRIGHTNESS_SAFE_MIN = 80   # Gamma安全区下限
-BRIGHTNESS_SAFE_MAX = 160  # Gamma安全区上限
-OTSU_FACTOR = 0.85         # OTSU阈值系数（<1=多保留边缘）
+TARGET_BRIGHTNESS = 120
+BRIGHTNESS_SAFE_MIN = 80
+BRIGHTNESS_SAFE_MAX = 160
+OTSU_FACTOR = 0.85
 CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
 
@@ -127,61 +129,86 @@ def gamma_correct(img_bgr, roi=None):
 # 检测核心：V通道 + OTSU + Canny融合
 # =========================================================================
 
-def _mask_to_polygons(mask, min_area=MIN_AREA):
+def _polys_from_mask(mask, min_area=MIN_AREA, max_area=MAX_AREA):
+    k7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    k15 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
     k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k5, iterations=2)
+
+    # 1. Close(7x7,3) + Close(15x15,1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k7, iterations=3)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k15, iterations=1)
+    # 2. Open(5x5,1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k5, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, k3, iterations=1)
+
+    # 3. border crop
+    mask[:BORDER_CROP, :] = 0
+    mask[-BORDER_CROP:, :] = 0
+    mask[:, :BORDER_CROP] = 0
+    mask[:, -BORDER_CROP:] = 0
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    filtered = [c for c in contours if min_area < cv2.contourArea(c) < max_area]
+    merged = _merge_overlapping(filtered)
+    merged.sort(key=cv2.contourArea, reverse=True)
+    merged = merged[:4]
+
     polys = []
-    for cnt in contours:
-        if cv2.contourArea(cnt) < min_area:
-            continue
+    for cnt in merged:
         hull = cv2.convexHull(cnt)
         peri = cv2.arcLength(hull, True)
         approx = cv2.approxPolyDP(hull, EPSILON * peri, True)
         if len(approx) >= 3:
             polys.append(approx.reshape(-1, 2).astype(np.int32))
-    polys.sort(key=lambda p: cv2.contourArea(p.reshape(-1, 1, 2)), reverse=True)
     return polys
 
 
+def _merge_overlapping(contours, overlap_thresh=0.5):
+    if len(contours) <= 1:
+        return contours
+    rects = [cv2.boundingRect(c) for c in contours]
+    parent = list(range(len(contours)))
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]; x = parent[x]
+        return x
+    def union(a, b):
+        parent[find(a)] = find(b)
+    for i in range(len(contours)):
+        for j in range(i + 1, len(contours)):
+            x1, y1, w1, h1 = rects[i]
+            x2, y2, w2, h2 = rects[j]
+            ix = max(0, min(x1 + w1, x2 + w2) - max(x1, x2))
+            iy = max(0, min(y1 + h1, y2 + h2) - max(y1, y2))
+            inter = ix * iy
+            a1, a2 = w1 * h1, w2 * h2
+            if inter > 0 and (inter / a1 > overlap_thresh or inter / a2 > overlap_thresh):
+                union(i, j)
+    groups = {}
+    for i in range(len(contours)):
+        root = find(i)
+        groups.setdefault(root, []).append(contours[i])
+    result = []
+    for g in groups.values():
+        result.append(g[0] if len(g) == 1 else cv2.convexHull(np.vstack(g)))
+    return result
+
+
 def detect_fused(frame_bgr):
-    """V通道 OTSU + Canny边缘融合。"""
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-
-    # V通道（用灰度图代替BGR→HSV→V，减少一次颜色转换）
-    # CLAHE 增强
     v_eq = CLAHE.apply(gray)
-
-    # OTSU 自动阈值
     otsu_thresh, _ = cv2.threshold(v_eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    thresh = otsu_thresh * OTSU_FACTOR  # 略低于理论最优，多保留边缘
+    thresh = otsu_thresh * OTSU_FACTOR
     _, mask_v = cv2.threshold(v_eq, thresh, 255, cv2.THRESH_BINARY)
-
-    # 排除分界线（图像中间水平窄带）
     mid_y = mask_v.shape[0] // 2
     mask_v[mid_y - 8 : mid_y + 8, :] = 0
-
-    # Canny 边缘融合
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blur, 30, 100)
     k7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    # V通道核心区膨胀 → Canny搜索范围
     core_dilated = cv2.morphologyEx(mask_v, cv2.MORPH_DILATE, k7, iterations=2)
     edges_filtered = cv2.bitwise_and(edges, core_dilated)
     edges_closed = cv2.morphologyEx(edges_filtered, cv2.MORPH_CLOSE, k7, iterations=2)
-
-    # 融合
     mask = cv2.bitwise_or(mask_v, edges_closed)
-    return _mask_to_polygons(mask), otsu_thresh
-
-
-# =========================================================================
-# 主检测
-# =========================================================================
+    return _polys_from_mask(mask), otsu_thresh
 
 def detect_robust(frame_bgr):
     warped, roi, has_warp = find_a4_roi(frame_bgr)
