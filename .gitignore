@@ -5,3 +5,5 @@
 !src/vision/*.py
 !src/algorithm/
 !src/algorithm/*.py
+!docs/
+!docs/*.md
