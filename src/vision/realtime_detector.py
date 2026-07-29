@@ -29,7 +29,7 @@ EPSILON = 0.008
 TARGET_BRIGHTNESS = 120
 BRIGHTNESS_SAFE_MIN = 80
 BRIGHTNESS_SAFE_MAX = 160
-OTSU_FACTOR = 0.85
+OTSU_FACTOR = 0.75    # 保留更多边缘，防止长条碎片被切断
 CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
 
@@ -189,12 +189,12 @@ def gamma_correct(img_bgr, roi=None):
 
 def _polys_from_mask(mask, min_area=MIN_AREA, max_area=MAX_AREA):
     k7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    k9 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    k11 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
     k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
-    # 1. Close(7x7,2) + Close(9x9,1) — 修复阴影但不粘连相邻碎片
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k7, iterations=2)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k9, iterations=1)
+    # 1. Close(7x7,3) + Close(11x11,1) — 填裂缝但不桥接相邻碎片(≥9px)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k7, iterations=3)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k11, iterations=1)
     # 2. Open(5x5,1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k5, iterations=1)
 
