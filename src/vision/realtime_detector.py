@@ -253,31 +253,26 @@ def _merge_overlapping(contours, overlap_thresh=0.5):
 
 def detect_fused(frame_bgr):
     """
-    V 自适应局部阈值（主力） + S 通道辅助。
+    深底白片：V 通道 OTSU（主力） + S<40 固定阈值（辅助排噪）。
 
-    V 自适应：每个 51×51 窗口独立判断亮度分界。
-      碎片一半在光里一半在阴影 → 两个窗口各自算出自己的阈值
-      → 碎片在两个窗口内都被正确切出。
-      深底板 V 低 → 即使自适应也不会被误检。
-
-    S 通道辅助：白色碎片 S≈0，不随光照变化。
-      排除有色噪点（桌面纹理、手等）。
+    V 通道：碎片永远比底板亮 → 双峰直方图 → OTSU 完美分离。
+    S 通道：白色碎片 S≈0，底板有色 S>0 → S<40 排除有色噪点。
+    AND 融合：既亮且无色 = 碎片。
     """
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     h, s, v = cv2.split(hsv)
 
-    # ---- V 通道：CLAHE → 自适应局部阈值（主力） ----
+    # ---- V 通道：CLAHE → OTSU ----
     v_eq = CLAHE.apply(v)
-    # Gaussian 局部阈值：每个 51×51 窗口独立算
-    mask_v = cv2.adaptiveThreshold(v_eq, 255,
-                                   cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                   cv2.THRESH_BINARY, 51, 10)
+    v_thresh, _ = cv2.threshold(v_eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    v_thresh = v_thresh * 0.85
+    _, mask_v = cv2.threshold(v_eq, v_thresh, 255, cv2.THRESH_BINARY)
 
-    # ---- S 通道：低饱和度 Mask（辅助排除有色噪点） ----
+    # ---- S 通道：固定 S<40 → 低饱和区 = 碎片 ----
     s_eq = CLAHE.apply(s)
-    _, mask_s = cv2.threshold(s_eq, 50, 255, cv2.THRESH_BINARY_INV)
+    _, mask_s = cv2.threshold(s_eq, 40, 255, cv2.THRESH_BINARY_INV)
 
-    # ---- 融合：V 自适应 AND S 低饱和 ----
+    # ---- AND 融合 ----
     mask = cv2.bitwise_and(mask_v, mask_s)
 
     # 排除分界线
@@ -294,14 +289,15 @@ def detect_fused(frame_bgr):
     edges_closed = cv2.morphologyEx(edges_filtered, cv2.MORPH_CLOSE, k7, iterations=2)
     mask = cv2.bitwise_or(mask, edges_closed)
 
-    return _polys_from_mask(mask), 0
+    return _polys_from_mask(mask), v_thresh
+
 
 def detect_robust(frame_bgr):
     warped, roi, has_warp = find_a4_roi(frame_bgr)
     corrected, brightness, gamma = gamma_correct(warped, roi)
 
-    polys, s_thresh = detect_fused(corrected)
-    mode = f"S+V({s_thresh:.0f})" if has_warp else f"S+V({s_thresh:.0f}) Raw"
+    polys, v_thresh = detect_fused(corrected)
+    mode = f"V+S({v_thresh:.0f})" if has_warp else f"V+S({v_thresh:.0f}) Raw"
 
     return polys, mode, brightness, gamma, warped, has_warp
 
