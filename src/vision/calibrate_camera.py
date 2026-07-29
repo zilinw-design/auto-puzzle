@@ -129,16 +129,86 @@ def collect_images(output_dir="calib_images", device=0):
     return count
 
 
+def collect_web(output_dir="calib_images", device=0, port=8081):
+    """HTTP 流模式：浏览器看棋盘格 → 手动保存截图。"""
+    from flask import Flask, Response
+    os.makedirs(output_dir, exist_ok=True)
+
+    cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(device)
+
+    app = Flask(__name__)
+    count = [0]
+
+    def generate():
+        while True:
+            ret, frame = cap.read()
+            if not ret: break
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            ret_cb, corners = cv2.findChessboardCorners(gray, CHESSBOARD_SIZE, None)
+            vis = frame.copy()
+            if ret_cb:
+                cv2.drawChessboardCorners(vis, CHESSBOARD_SIZE, corners, ret_cb)
+            cv2.putText(vis, f"Captured: {count[0]}  SPACE=save",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                        (0, 255, 0) if ret_cb else (0, 0, 255), 2)
+            _, jpg = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + jpg.tobytes() + b'\r\n')
+
+    @app.route('/')
+    def index():
+        return f"""<html><head><title>Calibration</title></head>
+        <body style="background:#111;text-align:center;font-family:Arial">
+        <h2 style="color:#fff">Camera Calibration ({CHESSBOARD_SIZE[0]}x{CHESSBOARD_SIZE[1]} {SQUARE_SIZE_MM}mm)</h2>
+        <img src="/stream" style="max-width:100%">
+        <p><a href="/capture" style="font-size:20px;color:#0f0">[ SAVE FRAME ]</a> — {count[0]} saved</p>
+        <p style="color:#666">棋盘格检测到（绿色标记）→ 点 SAVE → 换角度 → 重复 20+ 次</p></body></html>"""
+
+    @app.route('/stream')
+    def stream():
+        return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+    @app.route('/capture')
+    def capture():
+        ret, frame = cap.read()
+        if ret:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            ret_cb, corners = cv2.findChessboardCorners(gray, CHESSBOARD_SIZE, None)
+            if ret_cb:
+                path = os.path.join(output_dir, f"calib_{count[0]:03d}.jpg")
+                cv2.imwrite(path, frame)
+                count[0] += 1
+                return f"<h2 style='color:#0f0'>Saved #{count[0]}</h2><a href='/'>Back</a>"
+            return f"<h2 style='color:red'>Not detected!</h2><a href='/'>Back</a>"
+        return "<h2 style='color:red'>Read error</h2>"
+
+    print(f"\n{'='*55}")
+    print(f"  标定采集（HTTP 模式）")
+    print(f"  浏览器: http://<IP>:{port}")
+    print(f"  点 SAVE FRAME 拍照 | 换角度 | 重复 20+ 次")
+    print(f"{'='*55}\n")
+    app.run(host='0.0.0.0', port=port, threaded=True)
+    return count[0]
+
+
 def main():
     p = argparse.ArgumentParser(description="摄像头标定")
     p.add_argument("--device", type=int, default=0)
     p.add_argument("--recalibrate", action="store_true", help="跳过采集，直接用已有图片标定")
+    p.add_argument("--web", action="store_true", help="HTTP流模式（树莓派无显示器时使用）")
+    p.add_argument("--port", type=int, default=8081)
     p.add_argument("--output", type=str, default="camera_matrix.npz")
     p.add_argument("--image-dir", type=str, default="calib_images")
     args = p.parse_args()
 
     if args.recalibrate:
         calibrate_from_images(args.image_dir, args.output)
+    elif args.web:
+        n = collect_web(args.image_dir, args.device, args.port)
+        if n >= 10:
+            print("开始标定...")
+            calibrate_from_images(args.image_dir, args.output)
     else:
         n = collect_images(args.image_dir, args.device)
         if n >= 10:
