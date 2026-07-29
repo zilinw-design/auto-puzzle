@@ -29,13 +29,20 @@ COLORS = [(0, 255, 0), (0, 255, 255), (255, 0, 255), (255, 255, 0)]
 
 
 # ====== 摄像头 ======
-def camera_auto_setup(device="/dev/video0"):
+def camera_setup(device="/dev/video0"):
+    """
+    按 HD USB Camera Manual 最佳配置：
+      - 手动曝光 + 固定低快门时间  -> 解锁暗光降帧，稳定 60 FPS
+      - 自动白平衡保持色彩稳定
+    """
     try:
-        subprocess.run(["v4l2-ctl", "-d", device, "--set-ctrl=auto_exposure=3"],
-                       capture_output=True, timeout=3)
+        subprocess.run(["v4l2-ctl", "-d", device, "--set-ctrl=auto_exposure=1"],
+                       capture_output=True, timeout=3)     # Manual Mode
+        subprocess.run(["v4l2-ctl", "-d", device, "--set-ctrl=exposure_time_absolute=78"],
+                       capture_output=True, timeout=3)      # 1/128s ~7.8ms，解锁满帧
         subprocess.run(["v4l2-ctl", "-d", device, "--set-ctrl=white_balance_automatic=1"],
                        capture_output=True, timeout=3)
-        print("[Camera] AE + AWB = ON")
+        print("[Camera] Manual exposure 1/128s | AWB=ON")
     except Exception:
         pass
 
@@ -228,17 +235,19 @@ def main():
     p.add_argument("--device", type=int, default=0)
     args = p.parse_args()
 
-    camera_auto_setup(f"/dev/video{args.device}")
+    camera_setup(f"/dev/video{args.device}")
 
     cap = cv2.VideoCapture(args.device, cv2.CAP_V4L2)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_FPS, 60)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # 最小缓冲，消除帧积压延迟
     if not cap.isOpened():
         cap = cv2.VideoCapture(args.device)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+        cap.set(cv2.CAP_PROP_FPS, 60)
     if not cap.isOpened():
         print(f"[ERROR] /dev/video{args.device}"); return
 
