@@ -230,8 +230,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--display", action="store_true")
     p.add_argument("--port", type=int, default=8080)
-    p.add_argument("--width", type=int, default=1280)
-    p.add_argument("--height", type=int, default=720)
+    p.add_argument("--width", type=int, default=800)
+    p.add_argument("--height", type=int, default=600)
     p.add_argument("--device", type=int, default=0)
     args = p.parse_args()
 
