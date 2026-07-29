@@ -251,28 +251,58 @@ def _merge_overlapping(contours, overlap_thresh=0.5):
 
 
 def detect_fused(frame_bgr):
+    """
+    S+V 双通道融合检测。
+
+    S 通道（饱和度）——阴影不变量：
+      白色碎片 S≈0，无论明暗。有色底板 S>0。
+      用 OTSU 反转取低饱和度区域，阴影下也稳定。
+
+    V 通道（亮度）——排除暗区：
+      深色底板和黑分界线 V 低。用 V > 阈值排除这些暗区。
+
+    融合：S_low AND V_not_dark → 白色碎片候选。
+    """
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+
+    # ---- S 通道：CLAHE → OTSU 反转（低饱和度=碎片） ----
+    s_eq = CLAHE.apply(s)
+    s_thresh, _ = cv2.threshold(s_eq, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    s_thresh = max(s_thresh, 30)  # 最低保护，防止全图当碎片
+    _, mask_s = cv2.threshold(s_eq, s_thresh, 255, cv2.THRESH_BINARY_INV)
+
+    # ---- V 通道：CLAHE → OTSU（排除暗区：底板、分界线、深阴影） ----
+    v_eq = CLAHE.apply(v)
+    v_thresh, _ = cv2.threshold(v_eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    v_thresh = v_thresh * 0.8  # 略低于最优，宁可多保留
+    _, mask_v = cv2.threshold(v_eq, v_thresh, 255, cv2.THRESH_BINARY)
+
+    # ---- 融合：低饱和度 AND 足够亮 ----
+    mask = cv2.bitwise_and(mask_s, mask_v)
+
+    # 排除分界线
+    mid_y = mask.shape[0] // 2
+    mask[mid_y - 8 : mid_y + 8, :] = 0
+
+    # Canny 边缘补强（扑克牌图案场景）
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    v_eq = CLAHE.apply(gray)
-    otsu_thresh, _ = cv2.threshold(v_eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    thresh = otsu_thresh * OTSU_FACTOR
-    _, mask_v = cv2.threshold(v_eq, thresh, 255, cv2.THRESH_BINARY)
-    mid_y = mask_v.shape[0] // 2
-    mask_v[mid_y - 8 : mid_y + 8, :] = 0
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blur, 30, 100)
     k7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    core_dilated = cv2.morphologyEx(mask_v, cv2.MORPH_DILATE, k7, iterations=2)
+    core_dilated = cv2.morphologyEx(mask, cv2.MORPH_DILATE, k7, iterations=2)
     edges_filtered = cv2.bitwise_and(edges, core_dilated)
     edges_closed = cv2.morphologyEx(edges_filtered, cv2.MORPH_CLOSE, k7, iterations=2)
-    mask = cv2.bitwise_or(mask_v, edges_closed)
-    return _polys_from_mask(mask), otsu_thresh
+    mask = cv2.bitwise_or(mask, edges_closed)
+
+    return _polys_from_mask(mask), s_thresh
 
 def detect_robust(frame_bgr):
     warped, roi, has_warp = find_a4_roi(frame_bgr)
     corrected, brightness, gamma = gamma_correct(warped, roi)
 
-    polys, otsu_thresh = detect_fused(corrected)
-    mode = f"OTSU({otsu_thresh:.0f})" if has_warp else f"OTSU({otsu_thresh:.0f}) Raw"
+    polys, s_thresh = detect_fused(corrected)
+    mode = f"S+V({s_thresh:.0f})" if has_warp else f"S+V({s_thresh:.0f}) Raw"
 
     return polys, mode, brightness, gamma, warped, has_warp
 
