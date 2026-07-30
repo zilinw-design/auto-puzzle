@@ -116,6 +116,33 @@ def print_instructions(instructions, rect_w, rect_h, sample_id=""):
     print()
 
 
+def generate_from_pipeline(result):
+    """从 pipeline 输出生成并打印机械臂指令。"""
+    if not result.get("ok"):
+        print(f"\n❌ 求解失败: {result.get('error', '未知错误')}")
+        return
+
+    insts = result["instructions"]
+    rw, rh = result["target_mm"]
+    print(f"\n{'='*65}")
+    print(f"  机械臂指令 — {rw:.0f}×{rh:.0f}mm  (评分:{result['score']} 匹配:{result['matches']})")
+    print(f"{'='*65}")
+    print(f"  {'#':<4} {'F':<5} {'抓取(mm)':<18} {'→':<4} {'放置(mm)':<18} {'旋转':<8} {'移动':<8}")
+    print(f"  {'-'*60}")
+    for i, inst in enumerate(insts):
+        print(f"  {i+1:<4} F{inst['piece_id']:<4} "
+              f"({inst['pickup_mm'][0]:6.1f}, {inst['pickup_mm'][1]:6.1f})    →   "
+              f"({inst['place_mm'][0]:6.1f}, {inst['place_mm'][1]:6.1f})     "
+              f"{inst['rotation_deg']:+6.1f}°  {inst['distance_mm']:5.1f}mm")
+    print(f"  {'='*60}")
+    print(f"  操作序列:")
+    for i, inst in enumerate(insts):
+        print(f"  {i+1}. MOVE({inst['pickup_mm'][0]:.1f},{inst['pickup_mm'][1]:.1f}) "
+              f"→ GRIP → ROT {inst['rotation_deg']:+.1f}° "
+              f"→ MOVE({inst['place_mm'][0]:.1f},{inst['place_mm'][1]:.1f}) → RELEASE")
+    print()
+
+
 def main():
     p = argparse.ArgumentParser(description="拼图→机械臂指令")
     p.add_argument("--gt", type=str)
