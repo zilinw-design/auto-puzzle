@@ -15,6 +15,13 @@ realtime_detector.py — 实时碎片识别（红色A4纸 + 白色碎片）
 
 import cv2, numpy as np, argparse, time, subprocess, os
 
+# 鼠标 mm 坐标（全局变量，供 draw_overlay 和 display 函数共享）
+_mouse_px = np.array([0.0, 0.0])
+_mouse_H = None
+
+def _mouse_cb(event, x, y, flags, param):
+    global _mouse_px
+    _mouse_px = np.array([float(x), float(y)])
 
 # =========================================================================
 # 参数
@@ -383,17 +390,73 @@ def detect_fused(frame_bgr):
     mask = cv2.bitwise_or(mask, edges_closed)
 
     polys = _polys_from_mask(mask, px_per_mm)
-    return polys, v_thresh
+    return polys, v_thresh, paper_mask, px_per_mm
 
 
 def detect_robust(frame_bgr):
-    warped, roi, has_warp = find_red_paper_roi(frame_bgr)
-    corrected, brightness, gamma = gamma_correct(warped, roi)
+    """完整检测管线：红纸定位 → 碎片检测 → 像素转mm坐标。
+    返回: (polys_px, paper_H, paper_corners_px, mode, brightness, gamma, warped, has_warp)
+      polys_px: 碎片多边形(像素坐标)
+      paper_H: 3×3单应性矩阵(像素→A4纸面mm)
+      paper_corners_px: 纸面四角(像素)
+    """
+    # 红纸四角定位
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+    mask_red = cv2.inRange(h, 0, 10) | cv2.inRange(h, 170, 180)
+    _, s_high = cv2.threshold(s, 80, 255, cv2.THRESH_BINARY)
+    paper_raw = cv2.bitwise_and(mask_red, s_high)
+    k9 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    paper_raw = cv2.morphologyEx(paper_raw, cv2.MORPH_CLOSE, k9, iterations=3)
+    paper_raw = cv2.morphologyEx(paper_raw, cv2.MORPH_OPEN, k9, iterations=1)
 
-    polys, v_thresh = detect_fused(corrected)
-    mode = f"Red+V+S({v_thresh:.0f})" if has_warp else f"Red+V+S({v_thresh:.0f}) Raw"
+    cnts, _ = cv2.findContours(paper_raw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    paper_H = None
+    paper_corners_px = None
 
-    return polys, mode, brightness, gamma, warped, has_warp
+    if cnts:
+        paper_cnt = max(cnts, key=cv2.contourArea)
+        hull = cv2.convexHull(paper_cnt)
+        peri = cv2.arcLength(hull, True)
+        approx = cv2.approxPolyDP(hull, 0.02 * peri, True)
+        if len(approx) == 4:
+            # 排序四角: TL, TR, BR, BL
+            pts = approx.reshape(4, 2).astype(np.float32)
+            s_pts = pts.sum(axis=1); d_pts = np.diff(pts, axis=1)
+            ordered = np.array([
+                pts[np.argmin(s_pts)],      # TL
+                pts[np.argmin(d_pts)],      # TR
+                pts[np.argmax(s_pts)],      # BR
+                pts[np.argmax(d_pts)],      # BL
+            ], dtype=np.float32)
+            paper_corners_px = ordered
+            # 自动判断纸面方向：长边=297mm，短边=210mm
+            w_px = np.linalg.norm(ordered[1] - ordered[0])
+            h_px = np.linalg.norm(ordered[3] - ordered[0])
+            if w_px > h_px:
+                # 横向: X=297mm(长), Y=210mm(短)
+                dst = np.array([[0, 0], [297, 0], [297, 210], [0, 210]], dtype=np.float32)
+            else:
+                dst = np.array([[0, 0], [210, 0], [210, 297], [0, 297]], dtype=np.float32)
+            paper_H = cv2.getPerspectiveTransform(ordered, dst)
+
+    # Gamma + 检测
+    corrected, brightness, gamma = gamma_correct(frame_bgr, None)
+    polys_px, v_thresh, _, _ = detect_fused(corrected)
+
+    has_warp = paper_H is not None
+    mode = f"Red+V+S({v_thresh:.0f})" if has_warp else "Raw"
+
+    # 转换碎片 → mm 坐标
+    polys_mm = []
+    if paper_H is not None and len(polys_px) > 0:
+        for poly_px in polys_px:
+            pts_h = np.c_[poly_px.astype(np.float32), np.ones(len(poly_px))]
+            mm_h = (paper_H @ pts_h.T).T
+            pts_mm = mm_h[:, :2] / mm_h[:, 2:3]
+            polys_mm.append(pts_mm)
+
+    return polys_px, polys_mm, paper_H, paper_corners_px, mode, brightness, gamma, corrected, has_warp
 
 
 # =========================================================================
@@ -402,13 +465,30 @@ def detect_robust(frame_bgr):
 
 COLORS = [(0, 255, 0), (0, 255, 255), (255, 0, 255), (255, 255, 0)]
 
-def draw_overlay(warped, polygons, fps, mode, brightness, gamma, has_warp):
+def draw_overlay(warped, polygons_px, polys_mm, fps, mode, brightness, gamma, has_warp, paper_corners_px=None, paper_H=None):
+    global _mouse_px, _mouse_H
+    _mouse_H = paper_H
     vis = warped.copy()
     overlay = warped.copy()
-    for i, poly in enumerate(polygons):
+    for i, poly in enumerate(polygons_px):
         cv2.fillPoly(overlay, [poly.reshape((-1, 1, 2))], COLORS[i % 4])
     cv2.addWeighted(overlay, 0.25, vis, 0.75, 0, vis)
-    for i, poly in enumerate(polygons):
+
+    # 纸面四角标注
+    if paper_corners_px is not None and paper_H is not None:
+        w_px = np.linalg.norm(paper_corners_px[1] - paper_corners_px[0])
+        h_px = np.linalg.norm(paper_corners_px[3] - paper_corners_px[0])
+        pw, ph = (297, 210) if w_px > h_px else (210, 297)
+        names = [f"TL(0,0)", f"TR({pw},0)", f"BR({pw},{ph})", f"BL(0,{ph})"]
+        for i, pt in enumerate(paper_corners_px.astype(np.int32)):
+            cv2.circle(vis, tuple(pt), 6, (0, 0, 255), -1)
+            cv2.putText(vis, names[i], (pt[0] + 10, pt[1] + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 2)
+        cv2.polylines(vis, [paper_corners_px.reshape((-1, 1, 2)).astype(np.int32)], True, (255, 100, 0), 2)
+        cv2.polylines(vis, [paper_corners_px.reshape((-1, 1, 2)).astype(np.int32)], True, (255, 100, 0), 2)
+
+
+    for i, poly in enumerate(polygons_px):
         c = COLORS[i % 4]
         pts = poly.reshape(-1, 2)
         cv2.polylines(vis, [pts.reshape((-1, 1, 2))], True, c, 1)
@@ -421,16 +501,37 @@ def draw_overlay(warped, polygons, fps, mode, brightness, gamma, has_warp):
         if M["m00"] > 0:
             cx, cy = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
             cv2.circle(vis, (cx, cy), 4, c, -1)
-            cv2.putText(vis, f"F{i}", (cx + 8, cy),
+            if i < len(polys_mm):
+                mm_c = polys_mm[i].mean(axis=0)
+                label = f"F{i}({mm_c[0]:.0f},{mm_c[1]:.0f})mm"
+            else:
+                label = f"F{i}"
+            cv2.putText(vis, label, (cx + 8, cy),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, c, 2)
 
     h, w = vis.shape[:2]
-    bar = np.zeros((40, w, 3), dtype=np.uint8) + 40
-    warp_str = 'Warp' if has_warp else 'Raw'
+    bar_h = 42
+    bar = np.zeros((bar_h, w, 3), dtype=np.uint8) + 40
+    warp_str = 'H' if has_warp else 'Raw'
     bri_str = f"Bri:{brightness:.0f}"
     if abs(gamma - 1) > 0.01:
         bri_str += f" G:{gamma:.2f}"
-    cv2.putText(bar, f"Frags:{len(polygons)} | {warp_str} | {mode} | {bri_str} | {fps:.1f}fps",
+
+    # 鼠标 mm 坐标
+    mm_str = ""
+    if _mouse_H is not None and paper_corners_px is not None:
+        pt_h = np.array([_mouse_px[0], _mouse_px[1], 1.0])
+        mm = _mouse_H @ pt_h
+        mx, my = mm[0]/mm[2], mm[1]/mm[2]
+        w_px2 = np.linalg.norm(paper_corners_px[1] - paper_corners_px[0])
+        h_px2 = np.linalg.norm(paper_corners_px[3] - paper_corners_px[0])
+        pw2, ph2 = (297, 210) if w_px2 > h_px2 else (210, 297)
+        if 0 <= mx <= pw2 and 0 <= my <= ph2:
+            mm_str = f" | 鼠标:({mx:.0f},{my:.0f})mm"
+        else:
+            mm_str = " | 鼠标:纸面外"
+
+    cv2.putText(bar, f"Frags:{len(polygons_px)} | {warp_str} | {mode} | {bri_str} | {fps:.1f}fps{mm_str}",
                 (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     return np.vstack([bar, vis])
 
@@ -441,21 +542,98 @@ def draw_overlay(warped, polygons, fps, mode, brightness, gamma, has_warp):
 
 def run_display(cap, width, height):
     cv2.namedWindow("Detector", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Detector", width, height + 40)
-    print(f"[Display] {width}x{height}  Q=退出")
+    cv2.setMouseCallback("Detector", _mouse_cb)
+    cv2.resizeWindow("Detector", min(1000, width), min(700, height + 40))
+    print("C=捕获校准点 | P=打印校准表 | Q=退出")
+    # 校准点收集: [(algo_x, algo_y, real_x, real_y), ...]
+    calib_pts = []
     fps_t0, fps_cnt, fps_val = time.time(), 0, 0.0
+
     while True:
         ret, frame = cap.read()
         if not ret: break
         if frame.shape[1] != width: frame = cv2.resize(frame, (width, height))
-        polys, mode, bri, gam, warped, has_warp = detect_robust(frame)
-        vis = draw_overlay(warped, polys, fps_val, mode, bri, gam, has_warp)
+        polys_px, polys_mm, H, corners, mode, bri, gam, warped, has_warp = detect_robust(frame)
+        vis = draw_overlay(warped, polys_px, polys_mm, fps_val, mode, bri, gam, has_warp, corners, H)
+
+        # 在画面上标记已采集的校准点
+        if H is not None and len(calib_pts) > 0:
+            H_inv = np.linalg.inv(H)
+            for i, (ax, ay, _, _) in enumerate(calib_pts):
+                pt_h = np.array([ax, ay, 1.0])
+                px = (H_inv @ pt_h)
+                px = tuple((px[:2] / px[2]).astype(int))
+                cv2.circle(vis, px, 5, (255, 0, 255), -1)
+                cv2.putText(vis, f"P{i+1}", (px[0] + 8, px[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 2)
+
         cv2.imshow("Detector", vis)
-        if cv2.waitKey(1) & 0xFF == ord('q'): break
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord('q'):
+            break
+
+        elif key == ord('c'):
+            # 捕获当前鼠标位置为校准点
+            if H is not None:
+                pt_h = np.array([_mouse_px[0], _mouse_px[1], 1.0])
+                mm = H @ pt_h
+                mx, my = mm[0]/mm[2], mm[1]/mm[2]
+                if 0 <= mx <= 210 and 0 <= my <= 297:
+                    calib_pts.append((mx, my, 0, 0))
+                    print(f"  捕获 P{len(calib_pts)}: 算法=({mx:.1f}, {my:.1f})mm  ← 请用尺子量此处实际坐标")
+                else:
+                    print("  鼠标不在纸面范围内")
+
+        elif key == ord('p'):
+            # 打印完整校准表
+            n = len(calib_pts)
+            if n == 0 and len(polys_mm) >= 1:
+                # 无校准点时，打印碎片检测结果
+                print(f"\n--- 碎片检测 ({len(polys_mm)}块) ---")
+                for i, mm in enumerate(polys_mm):
+                    c = mm.mean(axis=0)
+                    print(f"  F{i}: 算法=({c[0]:.1f}, {c[1]:.1f})mm")
+                for i in range(len(polys_mm)):
+                    for j in range(i+1, len(polys_mm)):
+                        d = np.linalg.norm(polys_mm[i].mean(0) - polys_mm[j].mean(0))
+                        print(f"  F{i}↔F{j}: {d:.1f}mm")
+                print()
+            elif n > 0:
+                print(f"\n{'='*65}")
+                print(f"  校准数据 ({n}个点)")
+                print(f"  {'点':<6}{'算法X':>8}{'算法Y':>8}{'实测X':>8}{'实测Y':>8}{'比值X':>8}{'比值Y':>8}")
+                print(f"  {'-'*55}")
+                ratios_x, ratios_y = [], []
+                for i, (ax, ay, rx, ry) in enumerate(calib_pts):
+                    if rx > 0 and ry > 0:
+                        rx_v, ry_v = rx / ax, ry / ay
+                        ratios_x.append(rx_v); ratios_y.append(ry_v)
+                    else:
+                        rx_v, ry_v = 0, 0
+                    print(f"  P{i+1:<5}{ax:>8.1f}{ay:>8.1f}{rx:>8.1f}{ry:>8.1f}{rx_v:>8.3f}{ry_v:>8.3f}")
+                if ratios_x:
+                    print(f"  {'-'*55}")
+                    print(f"  均值:{'':>14}{np.mean(ratios_x):>8.3f}{np.mean(ratios_y):>8.3f}")
+                print(f"\n  复制下面填入实测值后重新校准:")
+                print(f"  calib_data = [")
+                for i, (ax, ay, rx, ry) in enumerate(calib_pts):
+                    print(f"    ({ax:.1f}, {ay:.1f}, 0, 0),  # P{i+1}: 实测=(?, ?)mm")
+                print(f"  ]")
+                print(f"{'='*65}\n")
+
+        elif key == ord('r') and len(calib_pts) > 0:
+            calib_pts.pop()
+            print(f"  删除最后一个点, 剩余{len(calib_pts)}个")
+
         fps_cnt += 1
         if fps_cnt % 30 == 0:
             fps_val = 30 / (time.time() - fps_t0); fps_t0 = time.time()
     cv2.destroyAllWindows()
+
+    # 退出时打印最终数据
+    if len(calib_pts) > 0:
+        print(f"\n退出。共捕获{len(calib_pts)}个校准点。")
+        print("填入实测值后更新 PAPER_SCALE 或做非均匀修正。")
 
 
 # =========================================================================
@@ -472,8 +650,8 @@ def run_http_stream(cap, width, height, port=8080):
             ret, frame = cap.read()
             if not ret: break
             if frame.shape[1] != width: frame = cv2.resize(frame, (width, height))
-            polys, mode, bri, gam, warped, has_warp = detect_robust(frame)
-            vis = draw_overlay(warped, polys, fps_val[0], mode, bri, gam, has_warp)
+            polys_px, polys_mm, H, corners, mode, bri, gam, warped, has_warp = detect_robust(frame)
+            vis = draw_overlay(warped, polys_px, polys_mm, fps_val[0], mode, bri, gam, has_warp, corners, H)
             _, jpg = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
             yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' +
                    jpg.tobytes() + b'\r\n')
