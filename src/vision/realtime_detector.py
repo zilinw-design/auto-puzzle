@@ -23,7 +23,7 @@ import cv2, numpy as np, argparse, time, subprocess, os
 # 参数
 # =========================================================================
 MIN_AREA = 200      # 极低只排除噪点，不限制碎片大小
-MAX_AREA = 15000    # 桌面背景面积远超碎片，用上限拦截
+MAX_AREA = 99999    # 纸面Mask负责过滤桌面，不需要面积上限
 BORDER_CROP = 10   # 透视矫正后向内裁剪 px，消除边界泄露
 EPSILON = 0.008
 TARGET_BRIGHTNESS = 120
@@ -342,8 +342,14 @@ def detect_fused(frame_bgr):
     s_eq = CLAHE.apply(s)
     _, mask_s = cv2.threshold(s_eq, 40, 255, cv2.THRESH_BINARY_INV)
 
+    # ---- 纸面限定（先膨胀填碎片亮洞，再限区域） ----
+    paper_mask = _find_dark_paper_mask(v)
+    k_fill = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
+    paper_mask = cv2.dilate(paper_mask, k_fill, iterations=3)
+
     # ---- AND 融合 ----
     mask = cv2.bitwise_and(mask_v, mask_s)
+    mask = cv2.bitwise_and(mask, paper_mask)
 
     # 排除分界线
     mid_y = mask.shape[0] // 2
