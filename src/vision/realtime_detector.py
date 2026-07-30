@@ -354,9 +354,8 @@ def detect_fused(frame_bgr):
     s_eq = CLAHE.apply(s)
     _, mask_s = cv2.threshold(s_eq, 40, 255, cv2.THRESH_BINARY_INV)
 
-    # ---- AND 融合 × 纸面限定 ----
+    # ---- AND 融合 ----
     mask = cv2.bitwise_and(mask_v, mask_s)
-    mask = cv2.bitwise_and(mask, paper_mask)
 
     # 排除分界线
     mid_y = mask.shape[0] // 2
