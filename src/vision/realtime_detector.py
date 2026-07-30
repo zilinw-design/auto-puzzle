@@ -327,17 +327,8 @@ def _find_dark_paper_mask(v_channel):
 
 def detect_fused(frame_bgr):
     """
-    深底白片检测。
-
-    1. 画面边缘裁剪 15%（排除木板桌面）
-    2. 深色纸面定位 → 只在纸面内检测
-    3. V 通道 OTSU + S<40 辅助
+    深底白片：V 通道 OTSU（主力） + S<40 固定阈值（辅助排噪）。
     """
-    h, w = frame_bgr.shape[:2]
-    crop_h1, crop_h2 = int(h * 0.1), int(h * 0.9)
-    crop_w1, crop_w2 = int(w * 0.1), int(w * 0.9)
-    frame_bgr = frame_bgr[crop_h1:crop_h2, crop_w1:crop_w2]
-
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     h, s, v = cv2.split(hsv)
 
