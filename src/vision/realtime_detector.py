@@ -189,16 +189,14 @@ def gamma_correct(img_bgr, roi=None):
 
 def _polys_from_mask(mask, min_area=MIN_AREA, max_area=MAX_AREA):
     k7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    k11 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
     k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
-    # 1. Close(7x7,3) + Close(11x11,1) — 填裂缝但不桥接相邻碎片(≥9px)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k7, iterations=3)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k11, iterations=1)
-    # 2. Open(5x5,1)
+    # Close(7x7,2) — 温和闭运算填孔
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k7, iterations=2)
+    # Open(5x5,1) — 去噪
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k5, iterations=1)
 
-    # 3. border crop
+    # 边界裁剪
     mask[:BORDER_CROP, :] = 0
     mask[-BORDER_CROP:, :] = 0
     mask[:, :BORDER_CROP] = 0
@@ -206,106 +204,17 @@ def _polys_from_mask(mask, min_area=MIN_AREA, max_area=MAX_AREA):
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     filtered = [c for c in contours if min_area < cv2.contourArea(c) < max_area]
-    # 先合并重叠的（阴影断裂），再合并距离<6px的（碎片间不碰）
-    merged = _merge_overlapping(filtered, overlap_thresh=0.7)
-    merged = _merge_close_neighbors(merged, max_gap_px=6)
-    merged.sort(key=cv2.contourArea, reverse=True)
-    merged = merged[:4]
+    filtered.sort(key=cv2.contourArea, reverse=True)
+    filtered = filtered[:4]
 
     polys = []
-    for cnt in merged:
+    for cnt in filtered:
         hull = cv2.convexHull(cnt)
         peri = cv2.arcLength(hull, True)
         approx = cv2.approxPolyDP(hull, EPSILON * peri, True)
         if len(approx) >= 3:
             polys.append(approx.reshape(-1, 2).astype(np.int32))
     return polys
-
-
-def _merge_overlapping(contours, overlap_thresh=0.5):
-    if len(contours) <= 1:
-        return contours
-    rects = [cv2.boundingRect(c) for c in contours]
-    parent = list(range(len(contours)))
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]; x = parent[x]
-        return x
-    def union(a, b):
-        parent[find(a)] = find(b)
-    for i in range(len(contours)):
-        for j in range(i + 1, len(contours)):
-            x1, y1, w1, h1 = rects[i]
-            x2, y2, w2, h2 = rects[j]
-            ix = max(0, min(x1 + w1, x2 + w2) - max(x1, x2))
-            iy = max(0, min(y1 + h1, y2 + h2) - max(y1, y2))
-            inter = ix * iy
-            a1, a2 = w1 * h1, w2 * h2
-            if inter > 0 and (inter / a1 > overlap_thresh or inter / a2 > overlap_thresh):
-                union(i, j)
-    groups = {}
-    for i in range(len(contours)):
-        root = find(i)
-        groups.setdefault(root, []).append(contours[i])
-    result = []
-    for g in groups.values():
-        result.append(g[0] if len(g) == 1 else cv2.convexHull(np.vstack(g)))
-    return result
-
-
-def _merge_close_neighbors(contours, max_gap_px=6):
-    """
-    合并距离很近的轮廓（修复碎片内部阴影裂缝）。
-    碎片间间距≥3mm(9px)，裂缝<2px，用 max_gap_px=6 安全分隔两者。
-    """
-    if len(contours) <= 1:
-        return contours
-    n = len(contours)
-    parent = list(range(n))
-
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]; x = parent[x]
-        return x
-
-    def union(a, b):
-        parent[find(a)] = find(b)
-
-    # 计算每个轮廓的最小间距
-    for i in range(n):
-        for j in range(i + 1, n):
-            # 两个轮廓之间的最小距离
-            min_d = cv2.pointPolygonTest(contours[i],
-                    (float(cv2.boundingRect(contours[j])[0] + cv2.boundingRect(contours[j])[2] / 2),
-                     float(cv2.boundingRect(contours[j])[1] + cv2.boundingRect(contours[j])[3] / 2)),
-                    True)
-            min_d = min(abs(min_d), _contour_distance(contours[i], contours[j], max_gap_px))
-            if min_d < max_gap_px:
-                union(i, j)
-
-    groups = {}
-    for i in range(n):
-        root = find(i)
-        groups.setdefault(root, []).append(contours[i])
-    result = []
-    for g in groups.values():
-        result.append(g[0] if len(g) == 1 else cv2.convexHull(np.vstack(g)))
-    return result
-
-
-def _contour_distance(c1, c2, max_gap=6):
-    """两个轮廓之间的最小距离。"""
-    r1 = cv2.boundingRect(c1)
-    r2 = cv2.boundingRect(c2)
-    # 快速 AABB 距离过滤
-    dx = max(0, max(r1[0], r2[0]) - min(r1[0] + r1[2], r2[0] + r2[2]))
-    dy = max(0, max(r1[1], r2[1]) - min(r1[1] + r1[3], r2[1] + r2[3]))
-    if dx > max_gap or dy > max_gap:
-        return float('inf')
-    min_d = float('inf')
-    for p1 in c1.reshape(-1, 2).astype(np.float32):
-        min_d = min(min_d, abs(cv2.pointPolygonTest(c2, tuple(p1), True)))
-    return min_d
 
 
 def detect_fused(frame_bgr):
