@@ -340,7 +340,7 @@ def detect_fused(frame_bgr):
 
     # ---- S 通道：固定 S<40 ----
     s_eq = CLAHE.apply(s)
-    _, mask_s = cv2.threshold(s_eq, 40, 255, cv2.THRESH_BINARY_INV)
+    _, mask_s = cv2.threshold(s_eq, 25, 255, cv2.THRESH_BINARY_INV)
 
     # ---- AND 融合 ----
     mask = cv2.bitwise_and(mask_v, mask_s)
