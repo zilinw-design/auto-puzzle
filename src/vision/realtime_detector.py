@@ -440,6 +440,43 @@ def detect_robust(frame_bgr):
                 dst = np.array([[0, 0], [210, 0], [210, 297], [0, 297]], dtype=np.float32)
             paper_H = cv2.getPerspectiveTransform(ordered, dst)
 
+    # 检测黑色分割线（局部对比度：纸内 V 通道竖直梯度最大处）
+    divider_y_mm = None
+    if paper_H is not None and cnts:
+        # 纸面 Mask
+        paper_mask = np.zeros_like(paper_raw)
+        cv2.drawContours(paper_mask, [max(cnts, key=cv2.contourArea)], -1, 255, -1)
+        # 纸面边界
+        ys, xs = np.where(paper_mask > 0)
+        if len(ys) > 100:
+            y_min, y_max = ys.min(), ys.max()
+            # 纸内 V 通道
+            v_paper = v.astype(np.float32)
+            v_paper[paper_mask == 0] = np.nan
+            # 每行平均 V（只算纸内像素）
+            row_v = np.nanmean(v_paper, axis=1)
+            # 在纸面中间 40%~60% 范围，找 V 最低的行
+            y_mid_start = y_min + (y_max - y_min) * 3 // 10
+            y_mid_end = y_min + (y_max - y_min) * 7 // 10
+            y_mid_start = max(y_min + 5, y_mid_start)
+            y_mid_end = min(y_max - 5, y_mid_end)
+            if y_mid_end > y_mid_start + 10:
+                segment = row_v[y_mid_start:y_mid_end]
+                # 比周围暗 30 以上且是局部最小
+                best_y = y_mid_start + np.nanargmin(segment)
+                best_v = row_v[best_y]
+                # 周围 20 行的平均
+                surround = np.concatenate([
+                    row_v[max(y_min, best_y-25):best_y-5],
+                    row_v[best_y+5:min(y_max, best_y+25)]
+                ])
+                surround_v = np.nanmean(surround) if len(surround) > 0 else 255
+                if not np.isnan(best_v) and not np.isnan(surround_v):
+                    if surround_v - best_v > 25:  # 比周围暗 25 以上算黑线
+                        pt_h = np.array([paper_mask.shape[1] / 2, best_y, 1.0])
+                        mm = paper_H @ pt_h
+                        divider_y_mm = mm[1] / mm[2]
+
     # Gamma + 检测
     corrected, brightness, gamma = gamma_correct(frame_bgr, None)
     polys_px, v_thresh, _, _ = detect_fused(corrected)
@@ -456,7 +493,7 @@ def detect_robust(frame_bgr):
             pts_mm = mm_h[:, :2] / mm_h[:, 2:3]
             polys_mm.append(pts_mm)
 
-    return polys_px, polys_mm, paper_H, paper_corners_px, mode, brightness, gamma, corrected, has_warp
+    return polys_px, polys_mm, paper_H, paper_corners_px, divider_y_mm, mode, brightness, gamma, corrected, has_warp
 
 
 # =========================================================================
@@ -465,7 +502,7 @@ def detect_robust(frame_bgr):
 
 COLORS = [(0, 255, 0), (0, 255, 255), (255, 0, 255), (255, 255, 0)]
 
-def draw_overlay(warped, polygons_px, polys_mm, fps, mode, brightness, gamma, has_warp, paper_corners_px=None, paper_H=None):
+def draw_overlay(warped, polygons_px, polys_mm, fps, mode, brightness, gamma, has_warp, paper_corners_px=None, paper_H=None, divider_y_mm=None):
     global _mouse_px, _mouse_H
     _mouse_H = paper_H
     vis = warped.copy()
@@ -485,8 +522,17 @@ def draw_overlay(warped, polygons_px, polys_mm, fps, mode, brightness, gamma, ha
             cv2.putText(vis, names[i], (pt[0] + 10, pt[1] + 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 2)
         cv2.polylines(vis, [paper_corners_px.reshape((-1, 1, 2)).astype(np.int32)], True, (255, 100, 0), 2)
-        cv2.polylines(vis, [paper_corners_px.reshape((-1, 1, 2)).astype(np.int32)], True, (255, 100, 0), 2)
 
+        # 黑色分割线
+        if divider_y_mm is not None:
+            H_inv = np.linalg.inv(paper_H)
+            p1 = (H_inv @ np.array([0, divider_y_mm, 1.0]))
+            p2 = (H_inv @ np.array([pw, divider_y_mm, 1.0]))
+            p1 = tuple((p1[:2] / p1[2]).astype(int))
+            p2 = tuple((p2[:2] / p2[2]).astype(int))
+            cv2.line(vis, p1, p2, (0, 0, 0), 3)
+            cv2.putText(vis, f"分割 Y={divider_y_mm:.0f}mm", (p1[0] + 5, p1[1] - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 2)
 
     for i, poly in enumerate(polygons_px):
         c = COLORS[i % 4]
@@ -553,8 +599,8 @@ def run_display(cap, width, height):
         ret, frame = cap.read()
         if not ret: break
         if frame.shape[1] != width: frame = cv2.resize(frame, (width, height))
-        polys_px, polys_mm, H, corners, mode, bri, gam, warped, has_warp = detect_robust(frame)
-        vis = draw_overlay(warped, polys_px, polys_mm, fps_val, mode, bri, gam, has_warp, corners, H)
+        polys_px, polys_mm, H, corners, div_y, mode, bri, gam, warped, has_warp = detect_robust(frame)
+        vis = draw_overlay(warped, polys_px, polys_mm, fps_val, mode, bri, gam, has_warp, corners, H, div_y)
 
         # 在画面上标记已采集的校准点
         if H is not None and len(calib_pts) > 0:
@@ -650,8 +696,8 @@ def run_http_stream(cap, width, height, port=8080):
             ret, frame = cap.read()
             if not ret: break
             if frame.shape[1] != width: frame = cv2.resize(frame, (width, height))
-            polys_px, polys_mm, H, corners, mode, bri, gam, warped, has_warp = detect_robust(frame)
-            vis = draw_overlay(warped, polys_px, polys_mm, fps_val[0], mode, bri, gam, has_warp, corners, H)
+            polys_px, polys_mm, H, corners, div_y, mode, bri, gam, warped, has_warp = detect_robust(frame)
+            vis = draw_overlay(warped, polys_px, polys_mm, fps_val[0], mode, bri, gam, has_warp, corners, H, div_y)
             _, jpg = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
             yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' +
                    jpg.tobytes() + b'\r\n')
