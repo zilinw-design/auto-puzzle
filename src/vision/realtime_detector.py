@@ -23,7 +23,7 @@ import cv2, numpy as np, argparse, time, subprocess, os
 # 参数
 # =========================================================================
 MIN_AREA = 200      # 极低只排除噪点，不限制碎片大小
-MAX_AREA = 99999    # 关闭上限，让 top-4 自然收敛
+MAX_AREA = 15000    # 桌面背景面积远超碎片，用上限拦截
 BORDER_CROP = 10   # 透视矫正后向内裁剪 px，消除边界泄露
 EPSILON = 0.008
 TARGET_BRIGHTNESS = 120
@@ -340,7 +340,7 @@ def detect_fused(frame_bgr):
 
     # ---- S 通道：固定 S<40 ----
     s_eq = CLAHE.apply(s)
-    _, mask_s = cv2.threshold(s_eq, 25, 255, cv2.THRESH_BINARY_INV)
+    _, mask_s = cv2.threshold(s_eq, 40, 255, cv2.THRESH_BINARY_INV)
 
     # ---- AND 融合 ----
     mask = cv2.bitwise_and(mask_v, mask_s)
