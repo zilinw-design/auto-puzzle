@@ -341,9 +341,6 @@ def detect_fused(frame_bgr):
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     h, s, v = cv2.split(hsv)
 
-    # ---- 深色纸面定位 ----
-    paper_mask = _find_dark_paper_mask(v)
-
     # ---- V 通道：CLAHE → OTSU ----
     v_eq = CLAHE.apply(v)
     v_thresh, _ = cv2.threshold(v_eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
