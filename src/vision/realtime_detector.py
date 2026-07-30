@@ -342,12 +342,16 @@ def detect_fused(frame_bgr):
     s_eq = CLAHE.apply(s)
     _, mask_s = cv2.threshold(s_eq, 40, 255, cv2.THRESH_BINARY_INV)
 
-    # ---- 纸面限定（先膨胀填碎片亮洞，再限区域） ----
+    # ---- 纸面定位：只在上半区纸面内检测 ----
     paper_mask = _find_dark_paper_mask(v)
-    k_fill = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
-    paper_mask = cv2.dilate(paper_mask, k_fill, iterations=3)
+    # 膨胀填碎片亮洞（碎片在暗纸上 = 亮斑会被反向 OTSU 排除）
+    k_fill = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35, 35))
+    paper_mask = cv2.dilate(paper_mask, k_fill, iterations=5)
+    # 只取上半区域（碎片摆放位置）
+    mid_y = paper_mask.shape[0] // 2
+    paper_mask[mid_y:, :] = 0
 
-    # ---- AND 融合 ----
+    # ---- AND 融合 × 纸面限定 ----
     mask = cv2.bitwise_and(mask_v, mask_s)
     mask = cv2.bitwise_and(mask, paper_mask)
 
