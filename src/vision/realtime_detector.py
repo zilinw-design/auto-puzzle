@@ -22,14 +22,14 @@ import cv2, numpy as np, argparse, time, subprocess, os
 # =========================================================================
 # 参数
 # =========================================================================
-MIN_AREA = 200      # 极低只排除噪点，不限制碎片大小
-MAX_AREA = 99999    # 关闭上限，让 top-4 自然收敛
+MIN_AREA = 500      # 极低只排除噪点，不限制碎片大小
+MAX_AREA = 20000    # 关闭上限，让 top-4 自然收敛
 BORDER_CROP = 10   # 透视矫正后向内裁剪 px，消除边界泄露
 EPSILON = 0.008
 TARGET_BRIGHTNESS = 120
 BRIGHTNESS_SAFE_MIN = 80
 BRIGHTNESS_SAFE_MAX = 160
-OTSU_FACTOR = 0.75    # 保留更多边缘，防止长条碎片被切断
+OTSU_FACTOR = 0.85    # 保留更多边缘，防止长条碎片被切断
 CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
 
@@ -322,7 +322,7 @@ def detect_fused(frame_bgr):
     # ---- V 通道：CLAHE → OTSU ----
     v_eq = CLAHE.apply(v)
     v_thresh, _ = cv2.threshold(v_eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    v_thresh = v_thresh * 0.85
+    v_thresh = v_thresh * OTSU_FACTOR
     _, mask_v = cv2.threshold(v_eq, v_thresh, 255, cv2.THRESH_BINARY)
 
     # ---- S 通道：固定 S<40 → 低饱和区 = 碎片 ----
