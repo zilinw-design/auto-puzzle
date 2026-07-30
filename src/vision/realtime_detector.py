@@ -1,15 +1,12 @@
 """
-realtime_detector.py — 实时碎片识别（深色底板 + 白色碎片，V通道OTSU）
+realtime_detector.py — 实时碎片识别（红色A4纸 + 白色碎片）
 
 流水线：
   1. 摄像头自动控制（AE + AWB）
-  2. A4纸四角白标定位 → 透视矫正
-  3. ROI亮度 → Gamma安全区 (80-160不触发)
-  4. CLAHE V通道增强
-  5. OTSU自动阈值 → V通道Mask
-  6. V自适应局部阈值(51×51) + S低饱和辅助
-  7. Canny边缘融合
-  8. 双级联Close + 重叠合并 + 面积过滤 + top-4
+  2. 红色纸面检测（H通道红色 + S通道高饱和）→ 纸面Mask
+  3. 红色纸面四角 → 透视矫正
+  4. 限定在纸面范围内：V通道OTSU + S低饱和辅助 + Canny融合
+  5. 形态学 + 重叠合并 + top-4
 
 用法：
   python realtime_detector.py                        # HTTP 流
@@ -22,14 +19,14 @@ import cv2, numpy as np, argparse, time, subprocess, os
 # =========================================================================
 # 参数
 # =========================================================================
-MIN_AREA = 200      # 极低只排除噪点，不限制碎片大小
-MAX_AREA = 99999    # 纸面Mask负责过滤桌面，不需要面积上限
-BORDER_CROP = 5    # 向内裁剪 px，消除边界泄露（不要切到碎片）
+MIN_AREA = 200
+MAX_AREA = 99999
+BORDER_CROP = 5
 EPSILON = 0.008
 TARGET_BRIGHTNESS = 120
 BRIGHTNESS_SAFE_MIN = 80
 BRIGHTNESS_SAFE_MAX = 160
-OTSU_FACTOR = 0.75    # 保留更多边缘，防止长条碎片被切断
+OTSU_FACTOR = 0.75
 CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
 
@@ -49,54 +46,81 @@ def camera_auto_setup(device="/dev/video0"):
 
 
 # =========================================================================
-# A4 纸定位（深色纸+白色角标） + 帧间平滑 + 质量门
+# 红色纸面定位（替换原白色角标方案）
 # =========================================================================
 
-# 角标坐标 EMA 平滑状态
-_smoothed_corners = None  # None = 未初始化，首次检测到后初始化
-EMA_ALPHA = 0.4           # 平滑系数: 0=完全不动 1=不用平滑
+_smoothed_corners = None
+EMA_ALPHA = 0.4
 
 
-def _extract_corners(frame_bgr):
+def _get_red_paper_mask(frame_bgr):
     """
-    多方法提取 A4 纸四角（候选点，未排序未验证）。
-    返回: (4×2) np.float32 数组 或 None
+    检测红色纸面区域。返回 Mask（纸内=255, 纸外=0）。
+    红色判定：H ∈ [0,10] ∪ [170,180] AND S > 80。
     """
-    # CLAHE 增强上半区对比度（角标在深色纸上的白色标记）
-    h, w = frame_bgr.shape[:2]
-    upper = frame_bgr[:h // 2, :, :]
-    gray_upper = cv2.cvtColor(upper, cv2.COLOR_BGR2GRAY)
-    gray_upper = CLAHE.apply(gray_upper)
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
 
-    # 方法1：CLAHE + Canny → 最大四边形
-    edges = cv2.Canny(gray_upper, 30, 100)
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        best = max(contours, key=cv2.contourArea)
-        peri = cv2.arcLength(best, True)
-        approx = cv2.approxPolyDP(best, 0.02 * peri, True)
-        if len(approx) == 4:
-            return approx.reshape(4, 2).astype(np.float32)
+    mask = cv2.inRange(h, 0, 10) | cv2.inRange(h, 170, 180)
+    _, s_thresh = cv2.threshold(s, 80, 255, cv2.THRESH_BINARY)
+    mask = cv2.bitwise_and(mask, s_thresh)
 
-    # 方法2：V通道亮斑 → minAreaRect 外接四边形
-    hsv = cv2.cvtColor(upper, cv2.COLOR_BGR2HSV)
-    v = CLAHE.apply(hsv[:, :, 2])
-    _, bright = cv2.threshold(v, 180, 255, cv2.THRESH_BINARY)
-    contours_b, _ = cv2.findContours(bright, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours_b:
-        all_pts = np.vstack([c.reshape(-1, 2) for c in contours_b])
-        if len(all_pts) >= 4:
-            rect = cv2.minAreaRect(all_pts.astype(np.float32))
-            return cv2.boxPoints(rect).astype(np.float32)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=3)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=1)
 
-    return None
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None, None
+
+    paper = max(contours, key=cv2.contourArea)
+    paper_mask = np.zeros_like(mask)
+    cv2.drawContours(paper_mask, [paper], -1, 255, -1)
+
+    # 向内轻微腐蚀，排除纸边缘反光过渡带
+    k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    paper_mask_tight = cv2.erode(paper_mask, k3, iterations=1)
+
+    return paper_mask, paper_mask_tight
+
+
+def _extract_red_paper_corners(frame_bgr):
+    """
+    从红色纸面提取四角（用于透视矫正）。
+    返回: (4×2) np.float32 或 None
+    """
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+
+    mask = cv2.inRange(h, 0, 10) | cv2.inRange(h, 170, 180)
+    _, s_thresh = cv2.threshold(s, 80, 255, cv2.THRESH_BINARY)
+    mask = cv2.bitwise_and(mask, s_thresh)
+
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=3)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=1)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    paper = max(contours, key=cv2.contourArea)
+    hull = cv2.convexHull(paper)
+    peri = cv2.arcLength(hull, True)
+    approx = cv2.approxPolyDP(hull, 0.02 * peri, True)
+
+    if len(approx) == 4:
+        return approx.reshape(4, 2).astype(np.float32)
+
+    # 四边形逼近失败时的兜底
+    rect = cv2.minAreaRect(paper)
+    return cv2.boxPoints(rect).astype(np.float32)
 
 
 def _quality_check(pts, frame_shape):
     """验证四点是否构成合理的 A4 纸四边形。"""
     if pts is None or len(pts) != 4:
         return False
-    # 排序后测量边长
     s = pts.sum(axis=1); diff = np.diff(pts, axis=1)
     ordered = np.array([pts[np.argmin(s)], pts[np.argmin(diff)],
                         pts[np.argmax(s)], pts[np.argmax(diff)]], dtype=np.float32)
@@ -104,45 +128,13 @@ def _quality_check(pts, frame_shape):
     w_bot = np.linalg.norm(ordered[2] - ordered[3])
     h_left = np.linalg.norm(ordered[3] - ordered[0])
     h_right = np.linalg.norm(ordered[2] - ordered[1])
-    # A4 比例 ~0.707 (210/297)
     ratio = ((w_top + w_bot) / 2) / ((h_left + h_right) / 2) if (h_left + h_right) > 0 else 0
-    if ratio < 0.5 or ratio > 0.9:  # 极宽或极窄 → 不合格
+    if ratio < 0.5 or ratio > 0.9:
         return False
-    # 面积 > 画面 15%
     area = cv2.contourArea(ordered.astype(np.int32).reshape(-1, 1, 2))
-    if area < frame_shape[0] * frame_shape[1] * 0.05:
+    if area < frame_shape[0] * frame_shape[1] * 0.03:
         return False
     return True
-
-
-def find_a4_roi(frame_bgr):
-    """
-    帧间平滑 + 质量门 + 透视矫正。
-    角标坐标经 EMA 平滑后再用于变换，消除画面抖动。
-    质量不合格 → 退回 Raw。
-    """
-    global _smoothed_corners
-
-    raw_pts = _extract_corners(frame_bgr)
-
-    if raw_pts is None:
-        # 本帧提取失败，继续用上一次的平滑坐标（如果有）
-        if _smoothed_corners is None:
-            return frame_bgr, None, False
-        raw_pts = _smoothed_corners  # 沿用上一帧
-
-    # EMA 平滑
-    if _smoothed_corners is None:
-        _smoothed_corners = raw_pts.astype(np.float32)
-    else:
-        _smoothed_corners = (EMA_ALPHA * raw_pts +
-                             (1 - EMA_ALPHA) * _smoothed_corners).astype(np.float32)
-
-    # 质量门
-    if not _quality_check(_smoothed_corners, frame_bgr.shape):
-        return frame_bgr, None, False
-
-    return _do_warp(frame_bgr, _smoothed_corners)
 
 
 def _do_warp(frame_bgr, pts):
@@ -161,6 +153,32 @@ def _do_warp(frame_bgr, pts):
     return warped, roi, True
 
 
+def find_red_paper_roi(frame_bgr):
+    """
+    红色纸面检测 + 帧间平滑 + 透视矫正。
+    返回: (warped, roi, has_warp)
+    """
+    global _smoothed_corners
+
+    raw_pts = _extract_red_paper_corners(frame_bgr)
+
+    if raw_pts is None:
+        if _smoothed_corners is None:
+            return frame_bgr, None, False
+        raw_pts = _smoothed_corners
+
+    if _smoothed_corners is None:
+        _smoothed_corners = raw_pts.astype(np.float32)
+    else:
+        _smoothed_corners = (EMA_ALPHA * raw_pts +
+                             (1 - EMA_ALPHA) * _smoothed_corners).astype(np.float32)
+
+    if not _quality_check(_smoothed_corners, frame_bgr.shape):
+        return frame_bgr, None, False
+
+    return _do_warp(frame_bgr, _smoothed_corners)
+
+
 # =========================================================================
 # Gamma 亮度自适应（安全区：80-160 不触发）
 # =========================================================================
@@ -173,7 +191,6 @@ def gamma_correct(img_bgr, roi=None):
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
         brightness = float(np.mean(gray))
 
-    # 安全区：不触发 Gamma
     if BRIGHTNESS_SAFE_MIN <= brightness <= BRIGHTNESS_SAFE_MAX:
         return img_bgr, brightness, 1.0
 
@@ -184,21 +201,30 @@ def gamma_correct(img_bgr, roi=None):
 
 
 # =========================================================================
-# 检测核心：V通道 + OTSU + Canny融合
+# 检测核心：先限定红色纸面，再在纸内找白色碎片
 # =========================================================================
 
-def _polys_from_mask(mask, min_area=MIN_AREA, max_area=MAX_AREA):
-    k7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    k11 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
-    k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+def _polys_from_mask(mask, px_per_mm=3.0, min_area=MIN_AREA, max_area=MAX_AREA):
+    """
+    自适应核大小：根据纸面像素比例缩放形态学核。
+    px_per_mm=3 (近距离): 核 7/11/5, merge_gap=6
+    px_per_mm=1 (远距离): 核 3/5/3, merge_gap=2
+    保证 Close 最多桥接 3mm 物理间隙（碎片内部裂缝），
+    而碎片间 1cm 间距永远不被桥接。
+    """
+    k_close = max(3, int(px_per_mm * 2.5))   # 主 Close 核
+    k_close2 = max(3, int(px_per_mm * 4))     # 大 Close 核
+    k_open = max(3, int(px_per_mm * 1.8))     # Open 核
+    merge_gap = max(2, int(px_per_mm * 2))    # 合并距离 (~2mm 物理)
 
-    # 1. Close(7x7,3) + Close(11x11,1) — 填裂缝但不桥接相邻碎片(≥9px)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k7, iterations=3)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k11, iterations=1)
-    # 2. Open(5x5,1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k5, iterations=1)
+    kernel_c = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_close, k_close))
+    kernel_c2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_close2, k_close2))
+    kernel_o = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_open, k_open))
 
-    # 3. border crop
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_c, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_c2, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_o, iterations=1)
+
     mask[:BORDER_CROP, :] = 0
     mask[-BORDER_CROP:, :] = 0
     mask[:, :BORDER_CROP] = 0
@@ -206,9 +232,8 @@ def _polys_from_mask(mask, min_area=MIN_AREA, max_area=MAX_AREA):
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     filtered = [c for c in contours if min_area < cv2.contourArea(c) < max_area]
-    # 先合并重叠的（阴影断裂），再合并距离<6px的（碎片间不碰）
     merged = _merge_overlapping(filtered, overlap_thresh=0.7)
-    merged = _merge_close_neighbors(merged, max_gap_px=6)
+    merged = _merge_close_neighbors(merged, max_gap_px=merge_gap)
     merged.sort(key=cv2.contourArea, reverse=True)
     merged = merged[:4]
 
@@ -254,27 +279,18 @@ def _merge_overlapping(contours, overlap_thresh=0.5):
 
 
 def _merge_close_neighbors(contours, max_gap_px=6):
-    """
-    合并距离很近的轮廓（修复碎片内部阴影裂缝）。
-    碎片间间距≥3mm(9px)，裂缝<2px，用 max_gap_px=6 安全分隔两者。
-    """
     if len(contours) <= 1:
         return contours
     n = len(contours)
     parent = list(range(n))
-
     def find(x):
         while parent[x] != x:
             parent[x] = parent[parent[x]]; x = parent[x]
         return x
-
     def union(a, b):
         parent[find(a)] = find(b)
-
-    # 计算每个轮廓的最小间距
     for i in range(n):
         for j in range(i + 1, n):
-            # 两个轮廓之间的最小距离
             min_d = cv2.pointPolygonTest(contours[i],
                     (float(cv2.boundingRect(contours[j])[0] + cv2.boundingRect(contours[j])[2] / 2),
                      float(cv2.boundingRect(contours[j])[1] + cv2.boundingRect(contours[j])[3] / 2)),
@@ -282,7 +298,6 @@ def _merge_close_neighbors(contours, max_gap_px=6):
             min_d = min(abs(min_d), _contour_distance(contours[i], contours[j], max_gap_px))
             if min_d < max_gap_px:
                 union(i, j)
-
     groups = {}
     for i in range(n):
         root = find(i)
@@ -294,10 +309,8 @@ def _merge_close_neighbors(contours, max_gap_px=6):
 
 
 def _contour_distance(c1, c2, max_gap=6):
-    """两个轮廓之间的最小距离。"""
     r1 = cv2.boundingRect(c1)
     r2 = cv2.boundingRect(c2)
-    # 快速 AABB 距离过滤
     dx = max(0, max(r1[0], r2[0]) - min(r1[0] + r1[2], r2[0] + r2[2]))
     dy = max(0, max(r1[1], r2[1]) - min(r1[1] + r1[3], r2[1] + r2[3]))
     if dx > max_gap or dy > max_gap:
@@ -308,83 +321,77 @@ def _contour_distance(c1, c2, max_gap=6):
     return min_d
 
 
-def _find_dark_paper_mask(v_channel):
-    """在 V 通道中找到大面积深色纸面区域。返回 Mask（纸内=255, 纸外=0）。"""
-    # 反向 OTSU：深色纸 = 低 V → THRESH_BINARY_INV 取暗区
-    _, dark = cv2.threshold(v_channel, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    # 形态学去噪 + 填孔
-    k15 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, k15, iterations=1)
-    dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, k15, iterations=1)
-    # 取最大连通域 = 纸面
-    contours, _ = cv2.findContours(dark, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        paper_mask = np.zeros_like(dark)
-        cv2.drawContours(paper_mask, [max(contours, key=cv2.contourArea)], -1, 255, -1)
-        return paper_mask
-    return np.ones_like(dark) * 255  # 找不到就全图放行
-
-
 def detect_fused(frame_bgr):
     """
-    深底白片：V 通道 OTSU（主力） + S<40 固定阈值（辅助排噪）。
+    红色纸面 + 白色碎片：
+    1. 先检测红色纸面 Mask（排除木板）
+    2. 只在纸面范围内做 V 通道 OTSU + S 低饱和检测
     """
-    # 裁掉左侧 20%（黑色底座干扰）
-    w_full = frame_bgr.shape[1]
-    crop_left = int(w_full * 0.20)
-    frame_bgr = frame_bgr[:, crop_left:]
-
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     h, s, v = cv2.split(hsv)
 
-    # ---- V 通道：CLAHE → OTSU ----
+    # ---- 第一步：红色纸面 Mask ----
+    mask_red = cv2.inRange(h, 0, 10) | cv2.inRange(h, 170, 180)
+    _, s_high = cv2.threshold(s, 80, 255, cv2.THRESH_BINARY)
+    paper_mask = cv2.bitwise_and(mask_red, s_high)
+
+    k9 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    paper_mask = cv2.morphologyEx(paper_mask, cv2.MORPH_CLOSE, k9, iterations=3)
+    paper_mask = cv2.morphologyEx(paper_mask, cv2.MORPH_OPEN, k9, iterations=1)
+
+    contours, _ = cv2.findContours(paper_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return [], 0
+
+    paper_mask = np.zeros_like(paper_mask)
+    cv2.drawContours(paper_mask, [max(contours, key=cv2.contourArea)], -1, 255, -1)
+    # 向内腐蚀，排除纸边缘反光过渡带
+    k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    paper_mask = cv2.erode(paper_mask, k3, iterations=1)
+
+    # 计算纸面像素比例（A4 宽 210mm）
+    paper_width_px = float(np.max(np.sum(paper_mask > 0, axis=0)))
+    px_per_mm = max(0.8, paper_width_px / 210.0)
+
+    # ---- 第二步：只在纸面范围内做 V 通道 OTSU ----
     v_eq = CLAHE.apply(v)
-    v_thresh, _ = cv2.threshold(v_eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    v_thresh = v_thresh * 0.85
+    v_inside = v_eq[paper_mask > 0]
+    if len(v_inside) < 1000:
+        return [], 0
+
+    v_thresh, _ = cv2.threshold(v_inside, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    v_thresh = v_thresh * OTSU_FACTOR
     _, mask_v = cv2.threshold(v_eq, v_thresh, 255, cv2.THRESH_BINARY)
 
-    # ---- S 通道：固定 S<40 ----
+    # ---- 第三步：S 通道低饱和 = 白色碎片 ----
     s_eq = CLAHE.apply(s)
     _, mask_s = cv2.threshold(s_eq, 40, 255, cv2.THRESH_BINARY_INV)
 
-    # ---- 排除红色底板（H 0-10 或 160-180） ----
-    mask_red = cv2.inRange(h, 0, 10) | cv2.inRange(h, 160, 180)
-    # 膨胀红色区域覆盖边缘反光过渡带
-    k_red = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    mask_red = cv2.dilate(mask_red, k_red, iterations=2)
-    mask_not_red = cv2.bitwise_not(mask_red)
-
-    # ---- AND 融合 × 非红色限定 ----
+    # ---- 第四步：融合 + 纸面限定（木板彻底排除）----
     mask = cv2.bitwise_and(mask_v, mask_s)
-    mask = cv2.bitwise_and(mask, mask_not_red)
+    mask = cv2.bitwise_and(mask, paper_mask)
 
-    # 排除分界线
-    mid_y = mask.shape[0] // 2
-    mask[mid_y - 8 : mid_y + 8, :] = 0
-
-    # Canny 边缘补强
+    # ---- 第五步：Canny 边缘补强（同样限定纸面内）----
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blur, 30, 100)
+    edges[paper_mask == 0] = 0
     k7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     core_dilated = cv2.morphologyEx(mask, cv2.MORPH_DILATE, k7, iterations=2)
     edges_filtered = cv2.bitwise_and(edges, core_dilated)
     edges_closed = cv2.morphologyEx(edges_filtered, cv2.MORPH_CLOSE, k7, iterations=2)
     mask = cv2.bitwise_or(mask, edges_closed)
 
-    polys = _polys_from_mask(mask)
-    # 修正坐标偏移（左侧裁切了 crop_left px）
-    for p in polys:
-        p[:, 0] += crop_left
+    polys = _polys_from_mask(mask, px_per_mm)
     return polys, v_thresh
 
 
 def detect_robust(frame_bgr):
-    warped, roi, has_warp = find_a4_roi(frame_bgr)
+    warped, roi, has_warp = find_red_paper_roi(frame_bgr)
     corrected, brightness, gamma = gamma_correct(warped, roi)
 
     polys, v_thresh = detect_fused(corrected)
-    mode = f"V+S({v_thresh:.0f})" if has_warp else f"V+S({v_thresh:.0f}) Raw"
+    mode = f"Red+V+S({v_thresh:.0f})" if has_warp else f"Red+V+S({v_thresh:.0f}) Raw"
 
     return polys, mode, brightness, gamma, warped, has_warp
 
@@ -478,7 +485,7 @@ def run_http_stream(cap, width, height, port=8080):
     def index():
         return f"""<html><head><title>Puzzle Detector</title></head>
         <body style="background:#111;text-align:center;font-family:Arial">
-        <h2 style="color:#fff">Fragment Detector — V-Channel OTSU</h2>
+        <h2 style="color:#fff">Fragment Detector — Red Paper + White Fragments</h2>
         <img src="/stream" style="max-width:100%">
         <p style="color:#666">{width}x{height} | :{port}</p></body></html>"""
 
@@ -488,7 +495,7 @@ def run_http_stream(cap, width, height, port=8080):
 
     print(f"\n{'='*50}")
     print(f"  HTTP: http://<IP>:{port}    {width}x{height}")
-    print(f"  深色底板+白碎片 | V通道OTSU | Gamma安全区80-160")
+    print(f"  红色纸面+白碎片 | H通道红色定位 | V通道OTSU | Gamma安全区80-160")
     print(f"{'='*50}\n")
     app.run(host='0.0.0.0', port=port, threaded=True)
 
