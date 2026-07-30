@@ -308,16 +308,41 @@ def _contour_distance(c1, c2, max_gap=6):
     return min_d
 
 
+def _find_dark_paper_mask(v_channel):
+    """在 V 通道中找到大面积深色纸面区域。返回 Mask（纸内=255, 纸外=0）。"""
+    # 反向 OTSU：深色纸 = 低 V → THRESH_BINARY_INV 取暗区
+    _, dark = cv2.threshold(v_channel, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    # 形态学去噪 + 填孔
+    k15 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, k15, iterations=1)
+    dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, k15, iterations=1)
+    # 取最大连通域 = 纸面
+    contours, _ = cv2.findContours(dark, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        paper_mask = np.zeros_like(dark)
+        cv2.drawContours(paper_mask, [max(contours, key=cv2.contourArea)], -1, 255, -1)
+        return paper_mask
+    return np.ones_like(dark) * 255  # 找不到就全图放行
+
+
 def detect_fused(frame_bgr):
     """
-    深底白片：V 通道 OTSU（主力） + S<40 固定阈值（辅助排噪）。
+    深底白片检测。
 
-    V 通道：碎片永远比底板亮 → 双峰直方图 → OTSU 完美分离。
-    S 通道：白色碎片 S≈0，底板有色 S>0 → S<40 排除有色噪点。
-    AND 融合：既亮且无色 = 碎片。
+    1. 画面边缘裁剪 15%（排除木板桌面）
+    2. 深色纸面定位 → 只在纸面内检测
+    3. V 通道 OTSU + S<40 辅助
     """
+    h, w = frame_bgr.shape[:2]
+    crop_h1, crop_h2 = int(h * 0.1), int(h * 0.9)
+    crop_w1, crop_w2 = int(w * 0.1), int(w * 0.9)
+    frame_bgr = frame_bgr[crop_h1:crop_h2, crop_w1:crop_w2]
+
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     h, s, v = cv2.split(hsv)
+
+    # ---- 深色纸面定位 ----
+    paper_mask = _find_dark_paper_mask(v)
 
     # ---- V 通道：CLAHE → OTSU ----
     v_eq = CLAHE.apply(v)
@@ -325,12 +350,13 @@ def detect_fused(frame_bgr):
     v_thresh = v_thresh * 0.85
     _, mask_v = cv2.threshold(v_eq, v_thresh, 255, cv2.THRESH_BINARY)
 
-    # ---- S 通道：固定 S<40 → 低饱和区 = 碎片 ----
+    # ---- S 通道：固定 S<40 ----
     s_eq = CLAHE.apply(s)
     _, mask_s = cv2.threshold(s_eq, 40, 255, cv2.THRESH_BINARY_INV)
 
-    # ---- AND 融合 ----
+    # ---- AND 融合 × 纸面限定 ----
     mask = cv2.bitwise_and(mask_v, mask_s)
+    mask = cv2.bitwise_and(mask, paper_mask)
 
     # 排除分界线
     mid_y = mask.shape[0] // 2
