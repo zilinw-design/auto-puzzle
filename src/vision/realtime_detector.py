@@ -310,41 +310,32 @@ def _contour_distance(c1, c2, max_gap=6):
 
 def detect_fused(frame_bgr):
     """
-    深底白片：V 通道 OTSU（主力） + S<40 固定阈值（辅助排噪）。
+    V 通道 OTSU（纯净版）。
 
-    V 通道：碎片永远比底板亮 → 双峰直方图 → OTSU 完美分离。
-    S 通道：白色碎片 S≈0，底板有色 S>0 → S<40 排除有色噪点。
-    AND 融合：既亮且无色 = 碎片。
+    深底白片 → V 通道天然双峰 → OTSU 分离碎片。
+    不加 S 过滤（避免亮桌面等低饱和背景误检）。
+    Canny 边缘仅做补强。
     """
-    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-    h, s, v = cv2.split(hsv)
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    v_eq = CLAHE.apply(gray)
 
-    # ---- V 通道：CLAHE → OTSU ----
-    v_eq = CLAHE.apply(v)
+    # V 通道 OTSU
     v_thresh, _ = cv2.threshold(v_eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     v_thresh = v_thresh * OTSU_FACTOR
-    _, mask_v = cv2.threshold(v_eq, v_thresh, 255, cv2.THRESH_BINARY)
-
-    # ---- S 通道：固定 S<40 → 低饱和区 = 碎片 ----
-    s_eq = CLAHE.apply(s)
-    _, mask_s = cv2.threshold(s_eq, 40, 255, cv2.THRESH_BINARY_INV)
-
-    # ---- AND 融合 ----
-    mask = cv2.bitwise_and(mask_v, mask_s)
+    _, mask = cv2.threshold(v_eq, v_thresh, 255, cv2.THRESH_BINARY)
 
     # 排除分界线
     mid_y = mask.shape[0] // 2
     mask[mid_y - 8 : mid_y + 8, :] = 0
 
     # Canny 边缘补强
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blur, 30, 100)
     k7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    core_dilated = cv2.morphologyEx(mask, cv2.MORPH_DILATE, k7, iterations=2)
-    edges_filtered = cv2.bitwise_and(edges, core_dilated)
-    edges_closed = cv2.morphologyEx(edges_filtered, cv2.MORPH_CLOSE, k7, iterations=2)
-    mask = cv2.bitwise_or(mask, edges_closed)
+    core = cv2.morphologyEx(mask, cv2.MORPH_DILATE, k7, iterations=2)
+    edges_f = cv2.bitwise_and(edges, core)
+    edges_c = cv2.morphologyEx(edges_f, cv2.MORPH_CLOSE, k7, iterations=2)
+    mask = cv2.bitwise_or(mask, edges_c)
 
     return _polys_from_mask(mask), v_thresh
 
