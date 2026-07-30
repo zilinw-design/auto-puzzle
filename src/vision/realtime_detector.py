@@ -329,6 +329,11 @@ def detect_fused(frame_bgr):
     """
     深底白片：V 通道 OTSU（主力） + S<40 固定阈值（辅助排噪）。
     """
+    # 裁掉左侧 20%（黑色底座干扰）
+    w_full = frame_bgr.shape[1]
+    crop_left = int(w_full * 0.20)
+    frame_bgr = frame_bgr[:, crop_left:]
+
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     h, s, v = cv2.split(hsv)
 
@@ -367,7 +372,11 @@ def detect_fused(frame_bgr):
     edges_closed = cv2.morphologyEx(edges_filtered, cv2.MORPH_CLOSE, k7, iterations=2)
     mask = cv2.bitwise_or(mask, edges_closed)
 
-    return _polys_from_mask(mask), v_thresh
+    polys = _polys_from_mask(mask)
+    # 修正坐标偏移（左侧裁切了 crop_left px）
+    for p in polys:
+        p[:, 0] += crop_left
+    return polys, v_thresh
 
 
 def detect_robust(frame_bgr):
