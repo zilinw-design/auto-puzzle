@@ -24,7 +24,7 @@ import cv2, numpy as np, argparse, time, subprocess, os
 # =========================================================================
 MIN_AREA = 200      # 极低只排除噪点，不限制碎片大小
 MAX_AREA = 99999    # 纸面Mask负责过滤桌面，不需要面积上限
-BORDER_CROP = 10   # 透视矫正后向内裁剪 px，消除边界泄露
+BORDER_CROP = 5    # 向内裁剪 px，消除边界泄露（不要切到碎片）
 EPSILON = 0.008
 TARGET_BRIGHTNESS = 120
 BRIGHTNESS_SAFE_MIN = 80
@@ -344,9 +344,9 @@ def detect_fused(frame_bgr):
 
     # ---- 纸面定位：只在上半区纸面内检测 ----
     paper_mask = _find_dark_paper_mask(v)
-    # 膨胀填碎片亮洞（碎片在暗纸上 = 亮斑会被反向 OTSU 排除）
-    k_fill = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35, 35))
-    paper_mask = cv2.dilate(paper_mask, k_fill, iterations=5)
+    # 膨胀填碎片亮洞（太大会把纸边桌面带进来）
+    k_fill = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    paper_mask = cv2.dilate(paper_mask, k_fill, iterations=3)
     # 只取上半区域（碎片摆放位置）
     mid_y = paper_mask.shape[0] // 2
     paper_mask[mid_y:, :] = 0
