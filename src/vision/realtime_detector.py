@@ -22,14 +22,14 @@ import cv2, numpy as np, argparse, time, subprocess, os
 # =========================================================================
 # 参数
 # =========================================================================
-MIN_AREA = 500      # 极低只排除噪点，不限制碎片大小
-MAX_AREA = 20000    # 关闭上限，让 top-4 自然收敛
+MIN_AREA = 200      # 极低只排除噪点，不限制碎片大小
+MAX_AREA = 99999    # 关闭上限，让 top-4 自然收敛
 BORDER_CROP = 10   # 透视矫正后向内裁剪 px，消除边界泄露
 EPSILON = 0.008
 TARGET_BRIGHTNESS = 120
 BRIGHTNESS_SAFE_MIN = 80
 BRIGHTNESS_SAFE_MAX = 160
-OTSU_FACTOR = 0.85    # 保留更多边缘，防止长条碎片被切断
+OTSU_FACTOR = 0.75    # 保留更多边缘，防止长条碎片被切断
 CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
 
@@ -189,14 +189,16 @@ def gamma_correct(img_bgr, roi=None):
 
 def _polys_from_mask(mask, min_area=MIN_AREA, max_area=MAX_AREA):
     k7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    k11 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
     k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
-    # Close(7x7,2) — 温和闭运算填孔
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k7, iterations=2)
-    # Open(5x5,1) — 去噪
+    # 1. Close(7x7,3) + Close(11x11,1) — 填裂缝但不桥接相邻碎片(≥9px)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k7, iterations=3)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k11, iterations=1)
+    # 2. Open(5x5,1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k5, iterations=1)
 
-    # 边界裁剪
+    # 3. border crop
     mask[:BORDER_CROP, :] = 0
     mask[-BORDER_CROP:, :] = 0
     mask[:, :BORDER_CROP] = 0
@@ -204,11 +206,14 @@ def _polys_from_mask(mask, min_area=MIN_AREA, max_area=MAX_AREA):
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     filtered = [c for c in contours if min_area < cv2.contourArea(c) < max_area]
-    filtered.sort(key=cv2.contourArea, reverse=True)
-    filtered = filtered[:4]
+    # 先合并重叠的（阴影断裂），再合并距离<6px的（碎片间不碰）
+    merged = _merge_overlapping(filtered, overlap_thresh=0.7)
+    merged = _merge_close_neighbors(merged, max_gap_px=6)
+    merged.sort(key=cv2.contourArea, reverse=True)
+    merged = merged[:4]
 
     polys = []
-    for cnt in filtered:
+    for cnt in merged:
         hull = cv2.convexHull(cnt)
         peri = cv2.arcLength(hull, True)
         approx = cv2.approxPolyDP(hull, EPSILON * peri, True)
@@ -217,34 +222,129 @@ def _polys_from_mask(mask, min_area=MIN_AREA, max_area=MAX_AREA):
     return polys
 
 
+def _merge_overlapping(contours, overlap_thresh=0.5):
+    if len(contours) <= 1:
+        return contours
+    rects = [cv2.boundingRect(c) for c in contours]
+    parent = list(range(len(contours)))
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]; x = parent[x]
+        return x
+    def union(a, b):
+        parent[find(a)] = find(b)
+    for i in range(len(contours)):
+        for j in range(i + 1, len(contours)):
+            x1, y1, w1, h1 = rects[i]
+            x2, y2, w2, h2 = rects[j]
+            ix = max(0, min(x1 + w1, x2 + w2) - max(x1, x2))
+            iy = max(0, min(y1 + h1, y2 + h2) - max(y1, y2))
+            inter = ix * iy
+            a1, a2 = w1 * h1, w2 * h2
+            if inter > 0 and (inter / a1 > overlap_thresh or inter / a2 > overlap_thresh):
+                union(i, j)
+    groups = {}
+    for i in range(len(contours)):
+        root = find(i)
+        groups.setdefault(root, []).append(contours[i])
+    result = []
+    for g in groups.values():
+        result.append(g[0] if len(g) == 1 else cv2.convexHull(np.vstack(g)))
+    return result
+
+
+def _merge_close_neighbors(contours, max_gap_px=6):
+    """
+    合并距离很近的轮廓（修复碎片内部阴影裂缝）。
+    碎片间间距≥3mm(9px)，裂缝<2px，用 max_gap_px=6 安全分隔两者。
+    """
+    if len(contours) <= 1:
+        return contours
+    n = len(contours)
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]; x = parent[x]
+        return x
+
+    def union(a, b):
+        parent[find(a)] = find(b)
+
+    # 计算每个轮廓的最小间距
+    for i in range(n):
+        for j in range(i + 1, n):
+            # 两个轮廓之间的最小距离
+            min_d = cv2.pointPolygonTest(contours[i],
+                    (float(cv2.boundingRect(contours[j])[0] + cv2.boundingRect(contours[j])[2] / 2),
+                     float(cv2.boundingRect(contours[j])[1] + cv2.boundingRect(contours[j])[3] / 2)),
+                    True)
+            min_d = min(abs(min_d), _contour_distance(contours[i], contours[j], max_gap_px))
+            if min_d < max_gap_px:
+                union(i, j)
+
+    groups = {}
+    for i in range(n):
+        root = find(i)
+        groups.setdefault(root, []).append(contours[i])
+    result = []
+    for g in groups.values():
+        result.append(g[0] if len(g) == 1 else cv2.convexHull(np.vstack(g)))
+    return result
+
+
+def _contour_distance(c1, c2, max_gap=6):
+    """两个轮廓之间的最小距离。"""
+    r1 = cv2.boundingRect(c1)
+    r2 = cv2.boundingRect(c2)
+    # 快速 AABB 距离过滤
+    dx = max(0, max(r1[0], r2[0]) - min(r1[0] + r1[2], r2[0] + r2[2]))
+    dy = max(0, max(r1[1], r2[1]) - min(r1[1] + r1[3], r2[1] + r2[3]))
+    if dx > max_gap or dy > max_gap:
+        return float('inf')
+    min_d = float('inf')
+    for p1 in c1.reshape(-1, 2).astype(np.float32):
+        min_d = min(min_d, abs(cv2.pointPolygonTest(c2, tuple(p1), True)))
+    return min_d
+
+
 def detect_fused(frame_bgr):
     """
-    V 通道 OTSU（纯净版）。
+    深底白片：V 通道 OTSU（主力） + S<40 固定阈值（辅助排噪）。
 
-    深底白片 → V 通道天然双峰 → OTSU 分离碎片。
-    不加 S 过滤（避免亮桌面等低饱和背景误检）。
-    Canny 边缘仅做补强。
+    V 通道：碎片永远比底板亮 → 双峰直方图 → OTSU 完美分离。
+    S 通道：白色碎片 S≈0，底板有色 S>0 → S<40 排除有色噪点。
+    AND 融合：既亮且无色 = 碎片。
     """
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    v_eq = CLAHE.apply(gray)
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
 
-    # V 通道 OTSU
+    # ---- V 通道：CLAHE → OTSU ----
+    v_eq = CLAHE.apply(v)
     v_thresh, _ = cv2.threshold(v_eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    v_thresh = v_thresh * OTSU_FACTOR
-    _, mask = cv2.threshold(v_eq, v_thresh, 255, cv2.THRESH_BINARY)
+    v_thresh = v_thresh * 0.85
+    _, mask_v = cv2.threshold(v_eq, v_thresh, 255, cv2.THRESH_BINARY)
+
+    # ---- S 通道：固定 S<40 → 低饱和区 = 碎片 ----
+    s_eq = CLAHE.apply(s)
+    _, mask_s = cv2.threshold(s_eq, 40, 255, cv2.THRESH_BINARY_INV)
+
+    # ---- AND 融合 ----
+    mask = cv2.bitwise_and(mask_v, mask_s)
 
     # 排除分界线
     mid_y = mask.shape[0] // 2
     mask[mid_y - 8 : mid_y + 8, :] = 0
 
     # Canny 边缘补强
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blur, 30, 100)
     k7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    core = cv2.morphologyEx(mask, cv2.MORPH_DILATE, k7, iterations=2)
-    edges_f = cv2.bitwise_and(edges, core)
-    edges_c = cv2.morphologyEx(edges_f, cv2.MORPH_CLOSE, k7, iterations=2)
-    mask = cv2.bitwise_or(mask, edges_c)
+    core_dilated = cv2.morphologyEx(mask, cv2.MORPH_DILATE, k7, iterations=2)
+    edges_filtered = cv2.bitwise_and(edges, core_dilated)
+    edges_closed = cv2.morphologyEx(edges_filtered, cv2.MORPH_CLOSE, k7, iterations=2)
+    mask = cv2.bitwise_or(mask, edges_closed)
 
     return _polys_from_mask(mask), v_thresh
 
