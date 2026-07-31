@@ -5,5 +5,9 @@
 !src/vision/*.py
 !src/algorithm/
 !src/algorithm/*.py
+!src/robot/
+!src/robot/*.py
+!src/robot/*.json
+!src/robot/*.md
 !docs/
 !docs/*.md
