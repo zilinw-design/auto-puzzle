@@ -11,8 +11,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from arm_controller import ArmController
 
 PORT = "COM7"
-WAIT_GRIP = 500
-WAIT_PLACE = 300
+WAIT_GRIP = 1000
+WAIT_PLACE = 1000
 SAFE_ABOVE = 35
 SETTLE_MS = 0.5
 PAUSE_SAFE = 0.5
@@ -71,16 +71,17 @@ def main():
         dz1 = g1[2]-s1[2]; dz2 = g2[2]-s2[2]
         print("[1] pick"); a.home(); a.wait(1000)
         move_safe(a,*s1)
-        a.move_by_delta(0,0,dz1); a.wait(2000)
-        time.sleep(SETTLE_MS); a.wait(WAIT_GRIP)
-        a.move_by_delta(0,0,-dz1); a.wait(2000)
-        time.sleep(PAUSE_SAFE)
+        a.move_by_delta(0,0,dz1); a.wait(2000)   # 到抓取面
+        time.sleep(2.0)                            # 停留2s
+        a.move_by_delta(0,0,-dz1); a.wait(2000)   # 回安全
+        time.sleep(1.0)                            # 停留1s
 
         print("[2] place"); a.home(); a.wait(1000)
         move_safe(a,*s2)
         a.move_by_delta(0,0,dz2); a.wait(2000)
-        time.sleep(SETTLE_MS); a.wait(WAIT_PLACE)
+        time.sleep(2.0)
         a.move_by_delta(0,0,-dz2); a.wait(2000)
+        time.sleep(1.0)
 
         print("[3] home"); a.home(); a.wait(1000)
         print("done.")
