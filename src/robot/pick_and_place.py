@@ -11,9 +11,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from arm_controller import ArmController
 
 PORT = "COM7"
-WAIT_GRIP = 3000    # 抓取停留 3s
-WAIT_PLACE = 3000   # 释放停留 3s
-SAFE_OFFSET = 10    # 安全高度 = 抓取 + 10mm dz
+WAIT_GRIP = 3000
+WAIT_PLACE = 3000
+SAFE_OFFSET = 15
+VISION_TO_ARM_Y = 14.7 / 14.85
+
+def vision_to_arm(x, y):
+    return x, y * VISION_TO_ARM_Y
 
 LIB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ikine_lib.json")
 
@@ -51,6 +55,8 @@ def main():
         return
     px, py = float(sys.argv[1]), float(sys.argv[2])
     tx, ty = float(sys.argv[3]), float(sys.argv[4])
+    px, py = vision_to_arm(px, py)
+    tx, ty = vision_to_arm(tx, ty)
 
     coef = load_fit()
     p_safe  = ikine(px, py, coef, SAFE_OFFSET)

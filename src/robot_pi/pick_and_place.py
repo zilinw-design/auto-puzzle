@@ -16,8 +16,17 @@ from arm_controller import ArmController
 
 WAIT_GRIP = 3000
 WAIT_PLACE = 3000
-SAFE_OFFSET = 10   # mm above grip
+SAFE_OFFSET = 15   # mm above grip (+5mm for reliable electromagnet contact)
 MOVE_SETTLE = 2000  # wait after big move
+
+# -- 坐标系映射: 视觉 → 机械臂 --
+# 视觉 Y范围 ±14.85cm, 机械臂 Y范围 ±14.7cm
+# y_arm = y_vis * (14.7 / 14.85)
+VISION_TO_ARM_Y = 14.7 / 14.85
+
+def vision_to_arm(x_vis, y_vis):
+    """视觉坐标 → 机械臂坐标"""
+    return x_vis, y_vis * VISION_TO_ARM_Y
 
 LIB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ikine_lib.json")
 
@@ -62,6 +71,10 @@ def main():
         return
     px, py = float(sys.argv[1]), float(sys.argv[2])
     tx, ty = float(sys.argv[3]), float(sys.argv[4])
+
+    # 视觉坐标 → 机械臂坐标
+    px, py = vision_to_arm(px, py)
+    tx, ty = vision_to_arm(tx, ty)
 
     coef = load_fit()
     p_safe = ikine(px, py, coef, SAFE_OFFSET)

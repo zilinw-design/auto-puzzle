@@ -11,7 +11,7 @@ from config import PORT
 from arm_controller import ArmController
 
 LIB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ikine_lib.json")
-SAFE_OFFSET = 10
+SAFE_OFFSET = 15
 
 def load_fit():
     lib = json.load(open(LIB_FILE))
