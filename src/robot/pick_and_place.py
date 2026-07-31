@@ -33,11 +33,22 @@ def load_fit():
             np.linalg.lstsq(A, DY, rcond=None)[0],
             np.linalg.lstsq(A, DZ, rcond=None)[0])
 
-def ikine(x, y, coef, dz_offset=0):
-    cx, cy, cz = coef
-    return (round(cx[0]*x + cx[1]*y + cx[2]),
-            round(cy[0]*x + cy[1]*y + cy[2]),
-            round(cz[0]*x + cz[1]*y + cz[2] + dz_offset))
+def idw_xyz(x, y, layer="grip"):
+    """IDW 查 dx/dy/dz, layer=grip/safe. 库中 dz 已精调"""
+    lib = json.load(open(LIB_FILE))
+    pts = [e for e in lib if e["layer"] == layer]
+    ws = {"dx": 0.0, "dy": 0.0, "dz": 0.0}
+    norm = 0.0
+    for e in pts:
+        d = ((x - e["x"])**2 + (y - e["y"])**2)**0.5
+        if d < 0.3:
+            return (e["dx"], e["dy"], e["dz"])
+        w = 1.0 / (d * d)
+        norm += w
+        ws["dx"] += w * e["dx"]
+        ws["dy"] += w * e["dy"]
+        ws["dz"] += w * e["dz"]
+    return (round(ws["dx"]/norm), round(ws["dy"]/norm), round(ws["dz"]/norm))
 
 def move_safe(arm, dx, dy, dz):
     steps = max(1, max(abs(dx), abs(dy), abs(dz)) // 100 + 1)
@@ -58,14 +69,13 @@ def main():
     px, py = vision_to_arm(px, py)
     tx, ty = vision_to_arm(tx, ty)
 
-    coef = load_fit()
-    p_safe  = ikine(px, py, coef, SAFE_OFFSET)
-    p_grip  = ikine(px, py, coef, 0)
-    t_safe  = ikine(tx, ty, coef, SAFE_OFFSET)
-    t_grip  = ikine(tx, ty, coef, 0)
+    p_safe = idw_xyz(px, py, "safe")
+    p_grip = idw_xyz(px, py, "grip")
+    t_safe = idw_xyz(tx, ty, "safe")
+    t_grip = idw_xyz(tx, ty, "grip")
 
-    print(f"拾取({px},{py}): safe={p_safe} grip={p_grip}")
-    print(f"释放({tx},{ty}): safe={t_safe} grip={t_grip}")
+    print(f"取({px},{py}): safe={p_safe} grip={p_grip}")
+    print(f"放({tx},{ty}): safe={t_safe} grip={t_grip}")
 
     arm = ArmController(PORT)
     if not arm.connect(): return
@@ -77,14 +87,19 @@ def main():
         print(f"\n[1] pick → safe{p_safe}"); input("  Enter: ")
         move_safe(arm, *p_safe); arm.wait(2000)
 
-        print(f"[2] descend Z-10 → grip"); input("  Enter: ")
-        arm.move_by_delta(0, 0, -SAFE_OFFSET); arm.wait(2000)
+        dz_down = p_grip[2] - p_safe[2]
+        print(f"[2] descend {dz_down} → grip"); input("  Enter: ")
+        if abs(dz_down) > 30:
+            arm.move_by_delta(0, 0, dz_down//2); arm.wait(1500)
+            arm.move_by_delta(0, 0, dz_down - dz_down//2); arm.wait(1500)
+        else:
+            arm.move_by_delta(0, 0, dz_down); arm.wait(2000)
 
         print(f"[3] grip wait {WAIT_GRIP/1000}s"); input("  Enter: ")
         arm.wait(WAIT_GRIP)
 
-        print(f"[4] rise Z+10 → safe"); input("  Enter: ")
-        arm.move_by_delta(0, 0, +SAFE_OFFSET); arm.wait(2000)
+        print(f"[4] rise {-dz_down} → safe"); input("  Enter: ")
+        arm.move_by_delta(0, 0, -dz_down); arm.wait(2000)
 
         # ── 复位 → 释放: 安全 → 下降 → 等3s → 上升 ──
         print(f"\n[5] home"); input("  Enter: ")
@@ -93,14 +108,19 @@ def main():
         print(f"[6] place → safe{t_safe}"); input("  Enter: ")
         move_safe(arm, *t_safe); arm.wait(2000)
 
-        print(f"[7] descend Z-10 → grip"); input("  Enter: ")
-        arm.move_by_delta(0, 0, -SAFE_OFFSET); arm.wait(2000)
+        dz_down2 = t_grip[2] - t_safe[2]
+        print(f"[7] descend {dz_down2} → grip"); input("  Enter: ")
+        if abs(dz_down2) > 30:
+            arm.move_by_delta(0, 0, dz_down2//2); arm.wait(1500)
+            arm.move_by_delta(0, 0, dz_down2 - dz_down2//2); arm.wait(1500)
+        else:
+            arm.move_by_delta(0, 0, dz_down2); arm.wait(2000)
 
         print(f"[8] release wait {WAIT_PLACE/1000}s"); input("  Enter: ")
         arm.wait(WAIT_PLACE)
 
-        print(f"[9] rise Z+10 → safe"); input("  Enter: ")
-        arm.move_by_delta(0, 0, +SAFE_OFFSET); arm.wait(2000)
+        print(f"[9] rise {-dz_down2} → safe"); input("  Enter: ")
+        arm.move_by_delta(0, 0, -dz_down2); arm.wait(2000)
 
         # ── 最后复位 ──
         print(f"\n[10] home"); input("  Enter: ")

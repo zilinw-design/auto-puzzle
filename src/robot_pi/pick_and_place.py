@@ -45,11 +45,17 @@ def load_fit():
             np.linalg.lstsq(A, DZ, rcond=None)[0])
 
 
-def ikine(x, y, coef, dz_offset=0):
-    cx, cy, cz = coef
-    return (round(cx[0]*x + cx[1]*y + cx[2]),
-            round(cy[0]*x + cy[1]*y + cy[2]),
-            round(cz[0]*x + cz[1]*y + cz[2] + dz_offset))
+def idw_xyz(x, y, layer="grip"):
+    import json
+    lib = json.load(open(LIB_FILE))
+    pts = [e for e in lib if e["layer"] == layer]
+    ws = {"dx": 0.0, "dy": 0.0, "dz": 0.0}; norm = 0.0
+    for e in pts:
+        d = ((x - e["x"])**2 + (y - e["y"])**2)**0.5
+        if d < 0.3: return (e["dx"], e["dy"], e["dz"])
+        w = 1.0 / (d * d); norm += w
+        ws["dx"] += w * e["dx"]; ws["dy"] += w * e["dy"]; ws["dz"] += w * e["dz"]
+    return (round(ws["dx"]/norm), round(ws["dy"]/norm), round(ws["dz"]/norm))
 
 
 def move_safe(arm, dx, dy, dz):
