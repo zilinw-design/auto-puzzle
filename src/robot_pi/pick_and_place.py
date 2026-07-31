@@ -24,8 +24,8 @@ def vision_to_arm(x, y):
 
 def idw_xyz(x, y, layer="grip"):
     """XY=线性拟合(17点残差17/11), Z=IDW(精调过)"""
-    dx = round(9.6*x + 0.3*y - 26)
-    dy = round(-0.3*x + 10.0*y - 6)
+    dx = round(9.4*x + 0.1*y - 21)
+    dy = round(0.3*x + 9.6*y + 2)
     lib = json.load(open(LIB_FILE))
     pts = [e for e in lib if e["layer"] == layer]
     ws, n = 0.0, 0.0
@@ -36,7 +36,9 @@ def idw_xyz(x, y, layer="grip"):
     return (dx, dy, round(ws/n))
 
 def rotate(arm, angle_deg):
-    pwm = round(1500 + angle_deg * 1000 / 45)
+    """#2 腕部旋转. PWM = 1500 + angle * 1000/90 (文档标准公式)"""
+    pwm = round(1500 + angle_deg * 1000 / 90)
+    print(f"  rotate {angle_deg:+.0f}deg -> #{2}={pwm}")
     arm.move_to_pose({2: pwm}, time_ms=2000)
     arm.wait(2500)
 
@@ -56,8 +58,8 @@ def main():
     px,py = vision_to_arm(float(sys.argv[1]),float(sys.argv[2]))
     tx,ty = vision_to_arm(float(sys.argv[3]),float(sys.argv[4]))
 
-    g1 = idw_xyz(px,py,"grip"); s1 = (g1[0],g1[1],g1[2]+SAFE_ABOVE)
-    g2 = idw_xyz(tx,ty,"grip"); s2 = (g2[0],g2[1],g2[2]+SAFE_ABOVE)
+    g1 = idw_xyz(px,py,"grip"); s1 = idw_xyz(px,py,"safe")
+    g2 = idw_xyz(tx,ty,"grip"); s2 = idw_xyz(tx,ty,"safe")
     print(f"Pick({px:.1f},{py:.1f}): safe={s1} grip={g1}")
     print(f"Place({tx:.1f},{ty:.1f}): safe={s2} grip={g2}")
     print("Ctrl+C=STOP")
@@ -66,18 +68,19 @@ def main():
     a = ArmController(PORT)
     if not a.connect(): return
     try:
+        dz1 = g1[2]-s1[2]; dz2 = g2[2]-s2[2]
         print("[1] pick"); a.home(); a.wait(1000)
         move_safe(a,*s1)
-        a.move_by_delta(0,0,-SAFE_ABOVE); a.wait(2000)
+        a.move_by_delta(0,0,dz1); a.wait(2000)
         time.sleep(SETTLE_MS); a.wait(WAIT_GRIP)
-        a.move_by_delta(0,0,SAFE_ABOVE); a.wait(2000)
+        a.move_by_delta(0,0,-dz1); a.wait(2000)
         time.sleep(PAUSE_SAFE)
 
         print("[2] place"); a.home(); a.wait(1000)
         move_safe(a,*s2)
-        a.move_by_delta(0,0,-SAFE_ABOVE); a.wait(2000)
+        a.move_by_delta(0,0,dz2); a.wait(2000)
         time.sleep(SETTLE_MS); a.wait(WAIT_PLACE)
-        a.move_by_delta(0,0,SAFE_ABOVE); a.wait(2000)
+        a.move_by_delta(0,0,-dz2); a.wait(2000)
 
         print("[3] home"); a.home(); a.wait(1000)
         print("done.")
