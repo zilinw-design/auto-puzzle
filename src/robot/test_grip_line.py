@@ -28,7 +28,7 @@ def main():
 
             print(f"\n=== ({x},{y}) safe={s} grip={g} dz={dz} ===")
             print("[0] home")
-            a.home(); a.wait(2000)
+            a.home(); a.wait(1000)
 
             print("[1] safe")
             move_safe(a, *s)
@@ -52,14 +52,14 @@ def main():
                 c = input("  > ").strip().lower()
             if c == 's':
                 a.move_by_delta(0, 0, -dz); a.wait(2000)
-                a.home(); a.wait(2000)
+                a.home(); a.wait(1000)
                 continue
 
             print("[3] rise")
             a.move_by_delta(0, 0, -dz); a.wait(2000)
 
             print("[4] home")
-            a.home(); a.wait(2000)
+            a.home(); a.wait(1000)
 
         print("\n全部完成。")
 

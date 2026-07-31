@@ -72,7 +72,7 @@ MAX_TIME = 30000
 DEFAULT_MOVE_TIME = 2000
 
 # 复位时间: robot_arm_init() 调用 robot_arm_reset(2000)
-RESET_TIME_MS = 2000
+RESET_TIME_MS = 1000
 
 # =========================================================================
 # 安全防护参数

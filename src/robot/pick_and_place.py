@@ -36,7 +36,9 @@ def idw_xyz(x, y, layer="grip"):
     return (dx, dy, round(ws/n))
 
 def rotate(arm, angle_deg):
-    pwm = round(1500 + angle_deg * 1000 / 45)
+    """#2 腕部旋转. PWM = 1500 + angle * 1000/90 (文档标准公式)"""
+    pwm = round(1500 + angle_deg * 1000 / 90)
+    print(f"  rotate {angle_deg:+.0f}deg -> #{2}={pwm}")
     arm.move_to_pose({2: pwm}, time_ms=2000)
     arm.wait(2500)
 
