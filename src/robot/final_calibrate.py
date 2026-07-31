@@ -115,14 +115,27 @@ def adjust(arm, dx, dy, dz, at_grip=False):
             print(f"  grip_dz={dz}")
 
 def main():
-    pts = all_pts()
-    print(f"共 {len(pts)} 点:")
-    for i, (x, y) in enumerate(pts):
-        print(f"  {i:2d}. ({x:5.1f},{y:5.1f})")
-    sel = input("输入序号(逗号分隔, 如 1,3,5) 或 Enter=全部: ").strip()
-    if sel:
-        idxs = [int(s.strip()) for s in sel.split(",") if s.strip().isdigit()]
-        pts = [pts[i] for i in idxs if 0 <= i < len(pts)]
+    mode = input("模式: 1=库中选点  2=输入新坐标  3=全部: ").strip()
+    if mode == '2':
+        pts = []
+        print("输入坐标 (x y), 空行结束:")
+        while True:
+            line = input("  > ").strip()
+            if not line: break
+            parts = line.split()
+            if len(parts) >= 2:
+                pts.append((float(parts[0]), float(parts[1])))
+    elif mode == '3':
+        pts = all_pts()
+    else:
+        pts = all_pts()
+        print(f"共 {len(pts)} 点:")
+        for i, (x, y) in enumerate(pts):
+            print(f"  {i:2d}. ({x:5.1f},{y:5.1f})")
+        sel = input("输入序号(逗号分隔) 或 Enter=全部: ").strip()
+        if sel:
+            idxs = [int(s.strip()) for s in sel.split(",") if s.strip().isdigit()]
+            pts = [pts[i] for i in idxs if 0 <= i < len(pts)]
     print(f"将标定 {len(pts)} 点")
 
     results = []
@@ -171,6 +184,16 @@ def main():
 
     except KeyboardInterrupt: print("\nSTOP")
     finally: arm.disconnect()
+
+    # 合并旧数据
+    old_pts = {}
+    if os.path.exists(OUT_FILE):
+        old = json.load(open(OUT_FILE))
+        for p in old.get("points",[]):
+            old_pts[(p["x"],p["y"])] = p
+    for r in results:
+        old_pts[(r["x"],r["y"])] = r
+    results = list(old_pts.values())
 
     with open(OUT_FILE,"w") as f:
         json.dump({"points":results,"total":len(results),
