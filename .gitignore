@@ -9,5 +9,7 @@
 !src/robot/*.py
 !src/robot/*.json
 !src/robot/*.md
+!src/robot_pi/
+!src/robot_pi/*
 !docs/
 !docs/*.md

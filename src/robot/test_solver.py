@@ -36,7 +36,7 @@ def move_safe(arm, dx, dy, dz):
         sz = ((i+1)*dz//steps) - (i*dz//steps)
         if sx or sy or sz:
             arm.move_by_delta(sx, sy, sz)
-            arm.wait(1200)
+            arm.wait(800)
 
 def main():
     x = float(sys.argv[1]) if len(sys.argv) > 1 else 6
@@ -69,10 +69,10 @@ def main():
     arm = ArmController(PORT)
     if not arm.connect(): return
     try:
-        print("[0] home"); input("  Enter: "); arm.home(); arm.wait(3500)
+        print("[0] home"); input("  Enter: "); arm.home(); arm.wait(2000)
         print(f"[1] safe ik({dx},{dy},{safe_dz})"); input("  Enter: ")
-        move_safe(arm, dx, dy, safe_dz); arm.wait(3500)
-        print("[2] home"); input("  Enter: "); arm.home(); arm.wait(3500)
+        move_safe(arm, dx, dy, safe_dz); arm.wait(2000)
+        print("[2] home"); input("  Enter: "); arm.home(); arm.wait(2000)
         print("done.")
     except KeyboardInterrupt: print("stop")
     finally: arm.disconnect()
